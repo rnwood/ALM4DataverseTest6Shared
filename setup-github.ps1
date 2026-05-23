@@ -2274,7 +2274,13 @@ $sharedWorkflowRepo = Invoke-WithErrorHandling -OperationName "Ensuring shared w
 }
 
 $sharedWorkflowRepository = $sharedWorkflowRepo.nameWithOwner
+$sharedWorkflowReference = 'main'
+if ($sharedWorkflowRepo.defaultBranchRef -and $sharedWorkflowRepo.defaultBranchRef.name) {
+    $sharedWorkflowReference = $sharedWorkflowRepo.defaultBranchRef.name
+}
+
 Write-Host "Shared workflow repository: $sharedWorkflowRepository" -ForegroundColor Green
+Write-Host "Shared workflow reference (synced branch): $sharedWorkflowReference" -ForegroundColor Green
 
 # ─────────────────────────────────────────────────────────────
 Write-Section "Select GitHub Repository"
@@ -2376,7 +2382,7 @@ try {
             -TargetRoot $cloneRoot `
             -Branch $defaultBranch `
             -SharedWorkflowRepository $sharedWorkflowRepository `
-            -SharedWorkflowRef $ALM4DataverseRef
+            -SharedWorkflowRef $sharedWorkflowReference
     } | Out-Null
 
     # ─────────────────────────────────────────────────────────
