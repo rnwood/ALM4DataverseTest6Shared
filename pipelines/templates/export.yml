@@ -52,7 +52,7 @@ stages:
               & "$(Pipeline.Workspace)/alm/pipelines/scripts/installdependencies.ps1"
               $environmentUrl = '$(ALM4DataverseSetConnectionVariables.EnvironmentUrl)'
               if ([string]::IsNullOrWhiteSpace($environmentUrl) -or $environmentUrl -match '^\$\(.+\)$') {
-                $environmentUrl = '$(PowerPlatformSetConnectionVariables.BuildTools.EnvironmentUrl)'
+                $environmentUrl = '$(BuildTools.EnvironmentUrl)'
               }
               if ([string]::IsNullOrWhiteSpace($environmentUrl) -or $environmentUrl -match '^\$\(.+\)$') {
                 throw "Environment URL could not be resolved from the selected connection variables task. Ensure the Power Platform service connection is configured correctly."
@@ -69,9 +69,9 @@ stages:
             ${{ if eq(parameters.useAlm4DataverseExtension, true) }}:
               AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
             ${{ if ne(parameters.useAlm4DataverseExtension, true) }}:
-              AZURE_CLIENT_ID: $(PowerPlatformSetConnectionVariables.BuildTools.ApplicationId)
-              AZURE_TENANT_ID: $(PowerPlatformSetConnectionVariables.BuildTools.TenantId)
-              AZURE_CLIENT_SECRET: $(PowerPlatformSetConnectionVariables.BuildTools.ClientSecret)
+              AZURE_CLIENT_ID: $(BuildTools.ApplicationId)
+              AZURE_TENANT_ID: $(BuildTools.TenantId)
+              AZURE_CLIENT_SECRET: $(BuildTools.ClientSecret)
 
         - pwsh: |
             $ErrorActionPreference = 'Stop'
