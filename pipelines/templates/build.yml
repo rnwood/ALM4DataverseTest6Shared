@@ -25,6 +25,12 @@ stages:
           inputs:
             AddToolsToPath: true
 
+        - task: UseDotNet@2
+          displayName: 'Install .NET SDK'
+          inputs:
+            packageType: 'sdk'
+            version: '8.x'
+
         - pwsh: |
             & "$(Pipeline.Workspace)/alm/pipelines/scripts/installdependencies.ps1"
             & "$(Pipeline.Workspace)/alm/pipelines/scripts/build.ps1" `
