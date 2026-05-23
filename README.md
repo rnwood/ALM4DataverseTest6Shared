@@ -26,6 +26,10 @@ Features:
    iwr https://github.com/ALM4Dataverse/ALM4Dataverse/releases/latest/download/setup-github.ps1 | iex
    ```
 
+    The setup script automatically detects whether GitHub environment approvals are
+    available for your repository and chooses the matching deployment strategy
+    (`environment-approval` or `manual-gate-tag` with prefixed repo-level credentials).
+
    Or follow the [GitHub Actions Setup Guide](docs/setup/github-setup.md) to configure manually.
 
 ### Azure DevOps

@@ -5,6 +5,10 @@ This guide describes how to set up ALM4Dataverse for use with GitHub Actions.
 > **Automated setup**: For most users, the easiest option is to run `setup-github.ps1` which automates
 > all of the steps below. See the [GitHub Actions Automated Setup Guide](github-automated-setup.md).
 
+> `setup-github.ps1` automatically selects deployment mode per repository:
+> - Uses GitHub environments + approvals + `promotion-mode: environment-approval` when supported.
+> - Falls back to prefixed repo-level credentials + `promotion-mode: manual-gate-tag` when not.
+
 > **Azure DevOps users**: if you are using Azure DevOps, follow the [Azure DevOps setup guide](azdo-manual-setup.md) instead.
 
 ---
@@ -147,18 +151,32 @@ Edit `alm-config.psd1` to list the solutions you want to manage:
 
 ### Configure deployment environments in `DEPLOY-main.yml`
 
-`DEPLOY-main.yml` handles all environments in a single workflow file:
+`DEPLOY-main.yml` uses one **stage/job per environment**.
 
-- **Automatic**: triggers when BUILD succeeds on `main` — deploys to TEST only.
-- **Manual**: go to **Actions** > **DEPLOY-main** > **Run workflow**, choose the
-  target environment from the dropdown (TEST-main, PROD, etc.), and enter the BUILD run ID.
+To configure it, edit only:
 
-Each environment has its own job with an independent `if:` condition, so only the selected
-environment runs.  Higher environments check a gate tag from the previous stage before
-proceeding.  See [Deployment Gates for GitHub Free](#deployment-gates-for-github-free).
+- each stage's `promotion-mode` value:
+  - `manual-gate-tag` (GitHub Free compatible; manual promotion + gate tag)
+  - `environment-approval` (auto-chain after previous stage success; relies on environment protection rules)
+- `workflow_dispatch.inputs.target-environment.options`
+- the `deploy-*` jobs (one per environment, with `needs` chaining)
+- keep the context payload lines unchanged in each stage:
+  - `github-context-json: ${{ toJSON(github) }}`
+  - `caller-inputs-json: ${{ toJSON(inputs) }}`
 
-To add or remove environments, edit the `target-environment` options list and add/remove
-the corresponding `deploy-*` job block in `DEPLOY-main.yml`.
+If you used `setup-github.ps1`, this value is generated automatically based on
+repository capability detection:
+
+- `environment-approval` when GitHub environment approvals are available.
+- `manual-gate-tag` when approvals are unavailable (prefixed credential fallback).
+
+Behavior remains simple:
+
+- **Automatic**: when BUILD succeeds on `main`, the first stage runs (typically TEST).
+- **Manual**: go to **Actions** > **DEPLOY-main** > **Run workflow**, provide
+  `build-run-id`, and choose `target-environment` (for example `PROD`).
+
+See [Deployment Gates for GitHub Free](#deployment-gates-for-github-free).
 
 If your default branch is not `main`:
 - Rename `DEPLOY-main.yml` to `DEPLOY-{branchname}.yml`
@@ -233,87 +251,42 @@ In the environment settings, you can add:
 
 #### 1.4 Configure your DEPLOY workflow (WIF)
 
-`DEPLOY-main.yml` contains a job per environment, with a choice of two promotion strategies.
-
-**`deploy-test`** — identical for both strategies:
+`DEPLOY-main.yml` uses explicit stage jobs and calls the reusable `deploy.yml`
+workflow for each environment:
 
 ```yaml
+jobs:
   deploy-test:
-    if: >
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success') ||
-      (github.event_name == 'workflow_dispatch' &&
-       inputs.target-environment == 'TEST-main')
     uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
-    permissions:
-      actions: read
-      contents: write
-      id-token: write
     with:
       environment-name: TEST-main
-      build-run-id: >-
-        ${{ github.event_name == 'workflow_dispatch'
-              && inputs.build-run-id
-              || github.event.workflow_run.id }}
-      success-gate-tag: >-
-        deployed/TEST-main/${{ github.event_name == 'workflow_dispatch'
-              && inputs.build-run-id
-              || github.event.workflow_run.id }}
-    secrets: inherit
-```
+      previous-environment-name: ''
+      promotion-mode: manual-gate-tag
+      github-context-json: ${{ toJSON(github) }}
+      caller-inputs-json: ${{ toJSON(inputs) }}
 
-**`deploy-prod` — Strategy A: GitHub Free (default)** — Manual re-trigger with gate tag.  A human goes to **Actions > DEPLOY-main > Run workflow**, selects PROD, and enters the BUILD run ID.  The job checks the gate tag to confirm TEST passed before proceeding.
-
-```yaml
-  deploy-prod:
-    if: >
-      github.event_name == 'workflow_dispatch' &&
-      inputs.target-environment == 'PROD'
-    uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
-    permissions:
-      actions: read
-      contents: write
-      id-token: write
-    with:
-      environment-name: PROD
-      build-run-id: ${{ inputs.build-run-id }}
-      required-gate-tag: deployed/TEST-main/${{ inputs.build-run-id }}
-      success-gate-tag:  deployed/PROD/${{ inputs.build-run-id }}
-    secrets: inherit
-```
-
-**`deploy-prod` — Strategy B: GitHub Pro/Team/Enterprise (opt-in)** — Auto-chains after TEST and is paused by the environment protection rule until an approver clicks **Approve**.  No manual re-trigger required.
-
-To use: comment out Strategy A and uncomment this block.  Also add **Required reviewers** to the PROD environment in Settings > Environments.
-
-```yaml
   deploy-prod:
     needs: deploy-test
-    if: >-
-      always() && (
-        (github.event_name == 'workflow_run' &&
-         needs.deploy-test.result == 'success') ||
-        (github.event_name == 'workflow_dispatch' &&
-         inputs.target-environment == 'PROD')
-      )
+    if: ${{ always() }}
     uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
-    permissions:
-      actions: read
-      contents: write
-      id-token: write
     with:
       environment-name: PROD
-      build-run-id: >-
-        ${{ github.event_name == 'workflow_dispatch'
-              && inputs.build-run-id
-              || github.event.workflow_run.id }}
-      # No required-gate-tag: the environment protection rule is the approval gate.
-      success-gate-tag: >-
-        deployed/PROD/${{ github.event_name == 'workflow_dispatch'
-              && inputs.build-run-id
-              || github.event.workflow_run.id }}
+      previous-environment-name: TEST-main
+      promotion-mode: manual-gate-tag
+      github-context-json: ${{ toJSON(github) }}
+      caller-inputs-json: ${{ toJSON(inputs) }}
     secrets: inherit
 ```
+
+To switch promotion strategy, change only:
+
+```yaml
+promotion-mode: manual-gate-tag   # or environment-approval
+```
+
+- `manual-gate-tag` (default): manual promotion for higher environment(s), gate tags enforced.
+- `environment-approval`: auto-chain to each next stage; approval handled by
+  GitHub environment protection rules.
 
 See [Deployment Gates for GitHub Free](#deployment-gates-for-github-free) for full details.
 
@@ -370,6 +343,9 @@ licence levels** including GitHub Free on private repositories.
 The reusable workflows auto-map prefixed names to the unprefixed runtime variables used
 by ALM4Dataverse scripts. You keep `secrets: inherit` and do not manually map prefixed
 secret names in the workflow YAML.
+
+This is also the automatic fallback used by `setup-github.ps1` when GitHub environment
+approval rules are not available for the selected repository.
 
 > ⚠️ **No approval gates**: Without environment protection rules there is no built-in
 > approval mechanism.  Anyone who can trigger the DEPLOY workflow can deploy to any
@@ -428,7 +404,7 @@ No extra credential wiring is needed in the copied workflow stubs:
 
 - `EXPORT.yml`: keep `secrets: inherit` (no prefixed `secrets:` block)
 - `IMPORT.yml`: keep `secrets: inherit` (no prefixed `secrets:` block)
-- `DEPLOY-main.yml`: keep the default jobs with `secrets: inherit`
+- `DEPLOY-main.yml`: keep the default stage jobs with `secrets: inherit`
 
 The same two deployment promotion strategies still apply exactly as shown in
 [1.4](#14-configure-your-deploy-workflow-wif); the only difference is where values
@@ -447,22 +423,21 @@ deployments without using any time-limited construct.
 ### How it works
 
 ```
-BUILD (auto) → DEPLOY-main auto-run (TEST only) → [human decision] → DEPLOY-main manual-run (PROD)
+BUILD (auto) → DEPLOY-main auto-run (TEST stage) → [human decision] → DEPLOY-main manual-run (PROD stage)
 ```
 
 1. **BUILD** runs automatically on every push to `main`.
-2. **DEPLOY-main** auto-triggers when BUILD succeeds and deploys to **TEST only**
-   (the `deploy-test` job's `if:` condition matches `workflow_run` events).
+2. **DEPLOY-main** auto-triggers when BUILD succeeds and deploys to the configured
+  **first stage environment** (typically `TEST-main`).
    On success it pushes a lightweight git tag:
    ```
    deployed/TEST-main/{build-run-id}
    ```
 3. A team member inspects the TEST deployment, then manually triggers **DEPLOY-main**
    again by going to **Actions** > **DEPLOY-main** > **Run workflow**, entering the
-   BUILD run ID, and selecting **PROD** from the `target-environment` dropdown.
-4. Only the `deploy-prod` job runs (its `if:` condition matches
-   `workflow_dispatch` + `target-environment == 'PROD'`).  It first checks via the
-   GitHub API whether the gate tag `deployed/TEST-main/{build-run-id}` exists.
+  BUILD run ID, and setting `target-environment` to the desired next stage.
+4. In `manual-gate-tag` mode, the selected stage checks via the GitHub API whether
+  the previous stage gate tag exists (`deployed/{previous-environment}/{build-run-id}`).
    If it doesn't — because TEST never succeeded for that build — the workflow
    **fails immediately** with a clear error:
    > *Deployment gate check FAILED: the tag `deployed/TEST-main/12345678` does not exist.
@@ -480,55 +455,44 @@ to which environment and in what order.
 | Property | Detail |
 |---|---|
 | No time limits | Gate tags are permanent — they don't expire |
-| Ordered promotion enforced | Cannot deploy to PROD without a successful TEST deployment for the same build |
-| No automatic cascade | Higher environment jobs only run when manually triggered with the right `target-environment` selection |
+| Ordered promotion enforced | Cannot deploy to a later stage without successful deployment of the previous stage for the same build |
+| No automatic cascade (manual mode) | Higher stage jobs only run when manually triggered with the right `target-environment` selection |
 | Single workflow file | Everything lives in `DEPLOY-main.yml` — no extra files to manage |
 | GitHub Free compatible | Uses only `contents: write` permission and the GitHub REST API |
 | Works with all credential approaches | WIF, client secret, or prefixed global secrets |
 
 ### Adding more stages (UAT)
 
-To add a UAT stage between TEST and PROD:
+Add another stage job and chain it between TEST and PROD.
 
-1. Add `UAT-main` to the `target-environment` options list in `DEPLOY-main.yml`.
-2. Add a `deploy-uat` job:
-   ```yaml
-   deploy-uat:
-     if: >
-       github.event_name == 'workflow_dispatch' &&
-       inputs.target-environment == 'UAT-main'
-     with:
-       environment-name: UAT-main
-       build-run-id: ${{ inputs.build-run-id }}
-       required-gate-tag: deployed/TEST-main/${{ inputs.build-run-id }}
-       success-gate-tag:  deployed/UAT-main/${{ inputs.build-run-id }}
-   ```
-3. Update `deploy-prod` to check the UAT gate:
-   ```yaml
-   required-gate-tag: deployed/UAT-main/${{ inputs.build-run-id }}
-   ```
+Example additions:
+
+1. Add `UAT-main` to `target-environment` options.
+2. Add `deploy-uat` with `needs: deploy-test`.
+3. Update `deploy-prod` to `needs: deploy-uat` and set its manual gate predecessor to `UAT-main`.
+
+In `manual-gate-tag` mode, each manual promotion checks its previous stage tag.
+In `environment-approval` mode, each stage auto-chains from the previous stage.
 
 ### GitHub Pro/Team/Enterprise alternative
 
-If you have environment protection rules available, use **Strategy B** in `DEPLOY-main.yml`
-to eliminate the manual re-trigger requirement:
+If you have environment protection rules available, set:
 
-1. In `DEPLOY-main.yml`, **comment out** the Strategy A `deploy-prod` block and
-   **uncomment** the Strategy B block (the one with `needs: deploy-test`).
-2. In **Settings > Environments > PROD**, add **Required reviewers**.
-
-Flow with Strategy B:
-```
-BUILD (auto) → deploy-test (auto) → deploy-prod (queued, awaiting approval) → [approver clicks Approve] → deploy-prod (runs)
+```yaml
+promotion-mode: environment-approval
 ```
 
-The `needs: deploy-test` ensures PROD only proceeds after TEST completes successfully.
-The environment protection rule pauses execution and notifies reviewers — no manual
-workflow re-trigger is needed.  The `success-gate-tag` is still pushed for auditability.
+Then add **Required reviewers** to your higher environment in
+**Settings > Environments**.
 
-The `always()` in `deploy-prod`'s `if:` condition means PROD can also be re-deployed
-directly by choosing it from the `target-environment` dropdown on a manual trigger,
-even when TEST is not re-running.
+Flow with `environment-approval` mode:
+```
+BUILD (auto) → stage 1 (auto) → stage 2 (queued/approval) → stage 3 (queued/approval) → ...
+```
+
+In this mode, each stage runs only after the previous stage succeeds on automatic runs.
+For manual runs, you can still deploy directly to a specific stage by setting
+`target-environment`.
 
 ---
 
@@ -562,7 +526,7 @@ On a **private repository with GitHub Free**:
   trigger.
 - Restrict `workflow_dispatch` permission using repository collaborator roles —
   only users with at least **Write** access can trigger manual workflows like
-  higher-environment targets in `DEPLOY-main.yml`.
+  later-stage targets in `DEPLOY-main.yml`.
 - Consider upgrading to GitHub Pro/Team for production workloads requiring formal
   approval workflows.
 
@@ -597,7 +561,7 @@ Once configured:
 - **BUILD** — runs automatically on every push. View run status in the **Actions** tab.
 - **EXPORT** — go to **Actions** > **EXPORT** > **Run workflow**, enter a commit message, and click **Run workflow**.
 - **IMPORT** — go to **Actions** > **IMPORT** > **Run workflow** and click **Run workflow**.
-- **DEPLOY-main** — runs automatically when BUILD succeeds on `main`, deploying to TEST only. To deploy to a higher environment, go to **Actions** > **DEPLOY-main** > **Run workflow**, select the target environment (e.g. PROD) from the dropdown, enter the BUILD run ID, and click **Run workflow**. The workflow verifies the previous stage's gate tag before proceeding.
+- **DEPLOY-main** — runs automatically when BUILD succeeds on `main`, deploying to the first configured stage (typically `TEST-main`). To deploy to a later stage, go to **Actions** > **DEPLOY-main** > **Run workflow**, set `target-environment` (for example `PROD`), enter the BUILD run ID, and click **Run workflow**. In `manual-gate-tag` mode, the workflow verifies the previous stage's gate tag before proceeding.
 
 ### Finding a BUILD run ID for manual deploy
 

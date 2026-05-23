@@ -662,13 +662,15 @@ function Invoke-GhApi {
 function Ensure-GitHubEnvironment {
     <#
     .SYNOPSIS
-        Creates a GitHub repository environment if it does not already exist.
+        Ensures a GitHub repository environment exists and optionally configures approvals.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Owner,
         [Parameter(Mandatory)][string]$Repo,
-        [Parameter(Mandatory)][string]$EnvironmentName
+        [Parameter(Mandatory)][string]$EnvironmentName,
+        [Parameter()][int[]]$RequiredReviewerIds,
+        [Parameter()][switch]$EnableApprovals
     )
 
     Write-Host "Ensuring GitHub environment '$EnvironmentName'..." -ForegroundColor DarkGray
@@ -676,17 +678,32 @@ function Ensure-GitHubEnvironment {
     # Check if environment already exists
     $existing = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -AllowNotFound
 
-    if ($existing) {
-        Write-Host "Environment '$EnvironmentName' already exists."
-        return $existing
+    $body = @{ wait_timer = 0 }
+    if ($EnableApprovals) {
+        $reviewers = @()
+        foreach ($reviewerId in @($RequiredReviewerIds)) {
+            if ($reviewerId -gt 0) {
+                $reviewers += @{ type = 'User'; id = $reviewerId }
+            }
+        }
+
+        if ($reviewers.Count -gt 0) {
+            $body.reviewers = $reviewers
+        }
     }
 
-    Write-Host "Creating environment '$EnvironmentName'..." -ForegroundColor Yellow
-    $body = @{ wait_timer = 0 }
-    $created = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -Method 'PUT' -Body $body
+    $action = if ($existing) { 'Updating' } else { 'Creating' }
+    Write-Host "$action environment '$EnvironmentName'..." -ForegroundColor Yellow
+    $updated = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -Method 'PUT' -Body $body
 
-    Write-Host "Created environment '$EnvironmentName'."
-    return $created
+    if ($EnableApprovals) {
+        Write-Host "Configured environment '$EnvironmentName' with required reviewers." -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "Configured environment '$EnvironmentName'." -ForegroundColor DarkGray
+    }
+
+    return $updated
 }
 
 function Set-GitHubEnvironmentSecret {
@@ -791,6 +808,107 @@ function Set-GitHubRepoVariable {
         throw "Failed to set repo variable '$VariableName': $($result -join "`n")"
     }
     Write-Host "Set repo-level variable '$VariableName'." -ForegroundColor DarkGray
+}
+
+function Get-GitHubEnvironmentCapabilities {
+    <#
+    .SYNOPSIS
+        Detects whether GitHub environments and environment approval rules are available for a repository.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter()][int]$ApprovalReviewerId
+    )
+
+    $probeName = "alm4dataverse-setup-probe-$([guid]::NewGuid().ToString('n').Substring(0, 8))"
+    $probeEndpoint = "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($probeName))"
+
+    $result = [ordered]@{
+        EnvironmentsAvailable = $false
+        ApprovalsAvailable    = $false
+        Message               = ''
+    }
+
+    try {
+        [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT' -Body @{ wait_timer = 0 })
+        $result.EnvironmentsAvailable = $true
+
+        if ($ApprovalReviewerId -gt 0) {
+            try {
+                [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT' -Body @{ wait_timer = 0; reviewers = @(@{ type = 'User'; id = $ApprovalReviewerId }) })
+                $result.ApprovalsAvailable = $true
+                $result.Message = 'GitHub environments and approval rules are available.'
+            }
+            catch {
+                $result.Message = "GitHub environments are available, but approval rules are not available for this repository: $($_.Exception.Message)"
+            }
+        }
+        else {
+            $result.Message = 'GitHub environments are available, but no reviewer id was provided for approval-rule probing.'
+        }
+    }
+    catch {
+        $result.Message = "GitHub environments are not available for this repository: $($_.Exception.Message)"
+    }
+    finally {
+        try {
+            [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'DELETE' -AllowNotFound)
+        }
+        catch {
+            # ignore probe cleanup errors
+        }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Get-GitHubEnvironmentPrefix {
+    <#
+    .SYNOPSIS
+        Derives a repository-level prefix from an environment name.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EnvironmentName
+    )
+
+    $normalized = ($EnvironmentName.Trim().ToUpperInvariant() -replace '[^A-Z0-9]+', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        throw "Could not derive a prefix from environment name '$EnvironmentName'."
+    }
+
+    return "${normalized}_"
+}
+
+function Set-GitHubPrefixedEnvironmentCredentials {
+    <#
+    .SYNOPSIS
+        Stores per-environment credentials as prefixed repository-level variables/secrets.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$EnvironmentName,
+        [Parameter(Mandatory)][object]$Credentials,
+        [Parameter(Mandatory)][string]$DataverseUrl,
+        [Parameter(Mandatory)][string]$ServiceAccountUPN
+    )
+
+    $prefix = Get-GitHubEnvironmentPrefix -EnvironmentName $EnvironmentName
+    Write-Host "Setting prefixed repo-level credentials for '$EnvironmentName' using prefix '$prefix'..." -ForegroundColor DarkGray
+
+    Set-GitHubRepoVariable -Owner $Owner -Repo $Repo -VariableName "${prefix}AZURE_CLIENT_ID" -VariableValue $Credentials.ApplicationId
+    Set-GitHubRepoVariable -Owner $Owner -Repo $Repo -VariableName "${prefix}AZURE_TENANT_ID" -VariableValue $Credentials.TenantId
+
+    if ($Credentials.AuthType -eq 'Secret' -and $Credentials.ClientSecret) {
+        Set-GitHubRepoSecret -Owner $Owner -Repo $Repo -SecretName "${prefix}AZURE_CLIENT_SECRET" -SecretValue $Credentials.ClientSecret
+    }
+
+    Set-GitHubRepoVariable -Owner $Owner -Repo $Repo -VariableName "${prefix}DATAVERSE_URL" -VariableValue $DataverseUrl
+    Set-GitHubRepoVariable -Owner $Owner -Repo $Repo -VariableName "${prefix}DATAVERSE_SERVICE_ACCOUNT_UPN" -VariableValue $ServiceAccountUPN
 }
 
 function Get-GitHubRepoList {
@@ -2216,6 +2334,136 @@ function Update-AlmConfigInRepoClone {
     Write-Host "Updated alm-config.psd1 with $($Solutions.Count) solution(s)."
 }
 
+function Update-DeployWorkflowInRepoClone {
+    <#
+    .SYNOPSIS
+        Rebuilds DEPLOY-{branch}.yml using selected deployment environments.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Branch,
+        [Parameter(Mandatory)][array]$DeploymentEnvironments,
+        [Parameter(Mandatory)][string]$SharedWorkflowRepository,
+        [Parameter(Mandatory)][string]$SharedWorkflowRef,
+        [Parameter()][ValidateSet('manual-gate-tag','environment-approval')][string]$PromotionMode = 'manual-gate-tag'
+    )
+
+    if (-not $DeploymentEnvironments -or $DeploymentEnvironments.Count -eq 0) {
+        Write-Host "No deployment environments selected; keeping default DEPLOY workflow template." -ForegroundColor Yellow
+        return
+    }
+
+    $deployFilePath = Join-Path $RepoRoot ".github/workflows/DEPLOY-$Branch.yml"
+    if (-not (Test-Path -LiteralPath $deployFilePath)) {
+        throw "Deploy workflow file not found: $deployFilePath"
+    }
+
+    $usesRef = "$SharedWorkflowRepository/.github/workflows/deploy.yml@$SharedWorkflowRef"
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $lines.Add("name: DEPLOY-$Branch")
+    $lines.Add("")
+    $lines.Add('# Stage-per-environment deployment workflow (generated by setup-github.ps1).')
+    $lines.Add('#')
+    $lines.Add('# To add another environment later:')
+    $lines.Add('#   1. Add it to workflow_dispatch target-environment options.')
+    $lines.Add('#   2. Add a deploy-* job and chain needs to the previous stage.')
+    $lines.Add('#   3. Set previous-environment-name to the previous stage short name.')
+    $lines.Add('')
+    $lines.Add('permissions:')
+    $lines.Add('  actions: read')
+    $lines.Add('  contents: write')
+    $lines.Add('  id-token: write')
+    $lines.Add('')
+    $lines.Add('on:')
+    $lines.Add('  workflow_run:')
+    $lines.Add("    workflows: ['BUILD']")
+    $lines.Add('    types: [completed]')
+    $lines.Add("    branches: [ '$Branch' ]")
+    $lines.Add('  workflow_dispatch:')
+    $lines.Add('    inputs:')
+    $lines.Add('      build-run-id:')
+    $lines.Add("        description: 'BUILD workflow run ID to deploy (find in Actions tab)'")
+    $lines.Add('        required: true')
+    $lines.Add('        type: string')
+    $lines.Add('      target-environment:')
+    $lines.Add("        description: 'Target environment to deploy to'")
+    $lines.Add('        required: true')
+    $lines.Add('        type: choice')
+    $lines.Add('        options:')
+
+    foreach ($env in $DeploymentEnvironments) {
+        $envNameEscaped = ([string]$env.ShortName).Replace("'", "''")
+        $lines.Add("          - '$envNameEscaped'")
+    }
+
+    $lines.Add('')
+    $lines.Add('jobs:')
+
+    $previousJobId = $null
+    $previousEnvName = ''
+    $jobIdSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    for ($i = 0; $i -lt $DeploymentEnvironments.Count; $i++) {
+        $envName = [string]$DeploymentEnvironments[$i].ShortName
+        $envNameEscaped = $envName.Replace("'", "''")
+
+        $baseJobId = ('deploy-' + (($envName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')))
+        if ([string]::IsNullOrWhiteSpace($baseJobId) -or $baseJobId -eq 'deploy-') {
+            $baseJobId = "deploy-stage-$($i + 1)"
+        }
+
+        $jobId = $baseJobId
+        $suffix = 2
+        while ($jobIdSet.Contains($jobId)) {
+            $jobId = "$baseJobId-$suffix"
+            $suffix++
+        }
+        [void]$jobIdSet.Add($jobId)
+
+        $lines.Add("  ${jobId}:")
+        if ($i -eq 0) {
+            $lines.Add('    # First stage in the chain.')
+        }
+        else {
+            $lines.Add("    needs: $previousJobId")
+            $lines.Add('    # Keep always() so manual promotion can run when previous stages are skipped.')
+            $lines.Add('    if: ${{ always() }}')
+        }
+
+        $lines.Add("    uses: $usesRef")
+        $lines.Add('    permissions:')
+        $lines.Add('      actions: read')
+        $lines.Add('      contents: write')
+        $lines.Add('      id-token: write')
+        $lines.Add('    with:')
+        $lines.Add("      environment-name: '$envNameEscaped'")
+        if ($i -eq 0) {
+            $lines.Add("      previous-environment-name: ''")
+        }
+        else {
+            $prevEscaped = $previousEnvName.Replace("'", "''")
+            $lines.Add("      previous-environment-name: '$prevEscaped'")
+        }
+        $lines.Add("      promotion-mode: $PromotionMode")
+        $lines.Add('      github-context-json: ${{ toJSON(github) }}')
+        $lines.Add('      caller-inputs-json: ${{ toJSON(inputs) }}')
+        $lines.Add('    secrets: inherit')
+        $lines.Add('')
+
+        $previousJobId = $jobId
+        $previousEnvName = $envName
+    }
+
+    $output = ($lines -join [Environment]::NewLine).TrimEnd() + [Environment]::NewLine
+    Set-Content -LiteralPath $deployFilePath -Value $output -NoNewline
+
+    $envList = ($DeploymentEnvironments | ForEach-Object { $_.ShortName }) -join ', '
+    Write-Host "Updated DEPLOY workflow '$deployFilePath' with environments: $envList (promotion mode: $PromotionMode)" -ForegroundColor Green
+}
+
 #endregion
 
 # ─────────────────────────────────────────────────────────────
@@ -2271,7 +2519,17 @@ $script:ghUser = (& gh api user --jq '.login' 2>&1)
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to determine GitHub username."
 }
+
+$script:ghUserId = $null
+$ghUserIdRaw = (& gh api user --jq '.id' 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -eq 0 -and $ghUserIdRaw -match '^\d+$') {
+    $script:ghUserId = [int]$ghUserIdRaw
+}
+
 Write-Host "Logged in as: $script:ghUser" -ForegroundColor Green
+if ($script:ghUserId) {
+    Write-Host "GitHub user id: $script:ghUserId" -ForegroundColor DarkGray
+}
 
 Write-Section "Authenticating with Azure"
 
@@ -2402,6 +2660,36 @@ if ($selectedRepo.defaultBranchRef -and $selectedRepo.defaultBranchRef.name) {
 }
 Write-Host "Default branch: $defaultBranch"
 
+$useGitHubEnvironments = $false
+$enableEnvironmentApprovals = $false
+$environmentApprovalReviewerIds = @()
+$deploymentPromotionMode = 'manual-gate-tag'
+
+Write-Host "Checking GitHub environment and approval-rule availability for '$repoFullName'..." -ForegroundColor Yellow
+$environmentCapabilities = Get-GitHubEnvironmentCapabilities -Owner $repoOwner -Repo $repoName -ApprovalReviewerId $script:ghUserId
+
+if ($environmentCapabilities.EnvironmentsAvailable -and $environmentCapabilities.ApprovalsAvailable) {
+    $useGitHubEnvironments = $true
+    $enableEnvironmentApprovals = $true
+    $deploymentPromotionMode = 'environment-approval'
+    if ($script:ghUserId) {
+        $environmentApprovalReviewerIds = @($script:ghUserId)
+    }
+
+    Write-Host "GitHub environments with approvals are available. Setup will configure environment credentials and approval gates." -ForegroundColor Green
+}
+else {
+    Write-Host "GitHub environments with approvals are unavailable for this repository. Setup will use prefixed repo-level credentials and tag-based promotion." -ForegroundColor Yellow
+}
+
+if (-not [string]::IsNullOrWhiteSpace($environmentCapabilities.Message)) {
+    Write-Host $environmentCapabilities.Message -ForegroundColor DarkGray
+}
+
+Write-Host "DEPLOY workflow promotion mode: $deploymentPromotionMode" -ForegroundColor DarkGray
+
+$deploymentEnvironments = @()
+
 # ─────────────────────────────────────────────────────────────
 Write-Section "Cloning Repository"
 
@@ -2474,6 +2762,27 @@ try {
     $devEnvUrl = if ($solutionResult) { $solutionResult.EnvironmentUrl } else { $null }
 
     # ─────────────────────────────────────────────────────────
+    Write-Section "Configure Deployment Workflow"
+
+    Write-Host "Select the Dataverse environments to deploy to (for example: TEST, UAT, PROD)." -ForegroundColor Green
+    Write-Host "This also updates DEPLOY-$defaultBranch.yml stage jobs and target-environment options." -ForegroundColor Green
+    Write-Host "" 
+
+    $deploymentEnvironments = Invoke-WithErrorHandling -OperationName "Selecting deployment environments" -ScriptBlock {
+        Get-DeploymentEnvironmentsSelection -ExcludeUrl $devEnvUrl
+    }
+
+    Invoke-WithErrorHandling -OperationName "Updating DEPLOY workflow" -ScriptBlock {
+        Update-DeployWorkflowInRepoClone `
+            -RepoRoot $cloneRoot `
+            -Branch $defaultBranch `
+            -DeploymentEnvironments $deploymentEnvironments `
+            -SharedWorkflowRepository $sharedWorkflowRepository `
+            -SharedWorkflowRef $sharedWorkflowReference `
+            -PromotionMode $deploymentPromotionMode
+    } | Out-Null
+
+    # ─────────────────────────────────────────────────────────
     # Commit and push the workflow template + config changes
     & git add -A
     & git diff --cached --quiet
@@ -2501,13 +2810,18 @@ finally {
 }
 
 # ─────────────────────────────────────────────────────────────
-Write-Section "Configure Dev Environment GitHub Environment"
+Write-Section "Configure Dev Environment Credentials"
 
 $script:cachedCredentials    = @()
 $script:cachedServiceAccounts = @()
 
 $devEnvShortName = "Dev-$defaultBranch"
-Write-Host "Setting up GitHub environment '$devEnvShortName' for the DEV Dataverse environment." -ForegroundColor Green
+if ($useGitHubEnvironments) {
+    Write-Host "Setting up GitHub environment '$devEnvShortName' for the DEV Dataverse environment." -ForegroundColor Green
+}
+else {
+    Write-Host "Setting up prefixed repo-level credentials for DEV environment '$devEnvShortName'." -ForegroundColor Green
+}
 Write-Host ""
 
 if (-not $devEnvUrl) {
@@ -2518,9 +2832,7 @@ if (-not $devEnvUrl) {
 }
 
 if ($devEnvUrl) {
-    Invoke-WithErrorHandling -OperationName "Setting up DEV GitHub environment" -ScriptBlock {
-        [void](Ensure-GitHubEnvironment -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName)
-
+    Invoke-WithErrorHandling -OperationName "Setting up DEV credentials" -ScriptBlock {
         $devCreds = Get-GitHubCredentialsForEnvironment `
             -ExistingCredentials $script:cachedCredentials `
             -TenantId $TenantId `
@@ -2535,23 +2847,9 @@ if ($devEnvUrl) {
             [void](Add-EntraIdFederatedCredential `
                 -ApplicationObjectId $devCreds.ApplicationObjectId `
                 -TenantId $TenantId `
-                -Subject "repo:$repoFullName`:environment:$devEnvShortName" `
+                -Subject "repo:$repoFullName`:environment:$($devEnvShortName.ToUpper())" `
                 -CredentialName $credName)
         }
-
-        # Set GitHub environment variables/secrets (non-sensitive values as variables)
-        Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
-            -VariableName "AZURE_CLIENT_ID" -VariableValue $devCreds.ApplicationId
-        Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
-            -VariableName "AZURE_TENANT_ID" -VariableValue $devCreds.TenantId
-        
-        if ($devCreds.AuthType -eq 'Secret' -and $devCreds.ClientSecret) {
-            Set-GitHubEnvironmentSecret -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
-                -SecretName "AZURE_CLIENT_SECRET" -SecretValue $devCreds.ClientSecret
-        }
-
-        Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
-            -VariableName "DATAVERSE_URL" -VariableValue $devEnvUrl
 
         # Service account
         $devServiceAccountUPN = Get-DataverseServiceAccountUPN `
@@ -2560,8 +2858,40 @@ if ($devEnvUrl) {
 
         $script:cachedServiceAccounts += $devServiceAccountUPN
 
-        Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
-            -VariableName "DATAVERSESERVICEACCOUNTUPN" -VariableValue $devServiceAccountUPN
+        if ($useGitHubEnvironments) {
+            [void](Ensure-GitHubEnvironment `
+                -Owner $repoOwner `
+                -Repo $repoName `
+                -EnvironmentName $devEnvShortName `
+                -EnableApprovals:$enableEnvironmentApprovals `
+                -RequiredReviewerIds $environmentApprovalReviewerIds)
+
+            # Set GitHub environment variables/secrets (non-sensitive values as variables)
+            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
+                -VariableName "AZURE_CLIENT_ID" -VariableValue $devCreds.ApplicationId
+            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
+                -VariableName "AZURE_TENANT_ID" -VariableValue $devCreds.TenantId
+
+            if ($devCreds.AuthType -eq 'Secret' -and $devCreds.ClientSecret) {
+                Set-GitHubEnvironmentSecret -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
+                    -SecretName "AZURE_CLIENT_SECRET" -SecretValue $devCreds.ClientSecret
+            }
+
+            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
+                -VariableName "DATAVERSE_URL" -VariableValue $devEnvUrl
+
+            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $devEnvShortName `
+                -VariableName "DATAVERSESERVICEACCOUNTUPN" -VariableValue $devServiceAccountUPN
+        }
+        else {
+            Set-GitHubPrefixedEnvironmentCredentials `
+                -Owner $repoOwner `
+                -Repo $repoName `
+                -EnvironmentName $devEnvShortName `
+                -Credentials $devCreds `
+                -DataverseUrl $devEnvUrl `
+                -ServiceAccountUPN $devServiceAccountUPN
+        }
 
         # Create Dataverse app user
         Ensure-DataverseApplicationUser -EnvironmentUrl $devEnvUrl -ApplicationId $devCreds.ApplicationId -TenantId $TenantId
@@ -2570,26 +2900,30 @@ if ($devEnvUrl) {
 }
 
 # ─────────────────────────────────────────────────────────────
-Write-Section "Configure Deployment Environments"
+Write-Section "Configure Deployment Environment Credentials"
 
-Write-Host "Select the Dataverse environments to deploy to (e.g. TEST, UAT, PROD)." -ForegroundColor Green
-Write-Host "For each environment you will be prompted to configure credentials." -ForegroundColor Green
+if ($useGitHubEnvironments) {
+    Write-Host "Configuring GitHub environment credentials for deployment stages." -ForegroundColor Green
+}
+else {
+    Write-Host "Configuring prefixed repo-level credentials for deployment stages." -ForegroundColor Green
+}
 Write-Host ""
 
-$deploymentEnvironments = Get-DeploymentEnvironmentsSelection -ExcludeUrl $devEnvUrl
+if ($deploymentEnvironments.Count -gt 0) {
+    Write-Host "Using deployment environments selected earlier: $($deploymentEnvironments.ShortName -join ', ')" -ForegroundColor DarkGray
+}
 
 if ($deploymentEnvironments.Count -eq 0) {
     Write-Host "No deployment environments selected. You can run this script again to add them later." -ForegroundColor Yellow
 }
 else {
     foreach ($env in $deploymentEnvironments) {
-        Write-Section "Setting up environment: $($env.ShortName)"
+        Write-Section "Setting up credentials: $($env.ShortName)"
         Write-Host "Dataverse URL: $($env.Url)" -ForegroundColor DarkGray
         Write-Host ""
 
-        Invoke-WithErrorHandling -OperationName "Setting up environment $($env.ShortName)" -AllowSkip -ScriptBlock {
-            [void](Ensure-GitHubEnvironment -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName)
-
+        Invoke-WithErrorHandling -OperationName "Setting up credentials for $($env.ShortName)" -AllowSkip -ScriptBlock {
             $creds = Get-GitHubCredentialsForEnvironment `
                 -ExistingCredentials $script:cachedCredentials `
                 -TenantId $TenantId `
@@ -2604,23 +2938,9 @@ else {
                 [void](Add-EntraIdFederatedCredential `
                     -ApplicationObjectId $creds.ApplicationObjectId `
                     -TenantId $TenantId `
-                    -Subject "repo:$repoFullName`:environment:$($env.ShortName)" `
+                    -Subject "repo:$repoFullName`:environment:$($env.ShortName.ToUpper())" `
                     -CredentialName $credName)
             }
-
-            # Set GitHub environment variables/secrets (non-sensitive values as variables)
-            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
-                -VariableName "AZURE_CLIENT_ID" -VariableValue $creds.ApplicationId
-            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
-                -VariableName "AZURE_TENANT_ID" -VariableValue $creds.TenantId
-
-            if ($creds.AuthType -eq 'Secret' -and $creds.ClientSecret) {
-                Set-GitHubEnvironmentSecret -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
-                    -SecretName "AZURE_CLIENT_SECRET" -SecretValue $creds.ClientSecret
-            }
-
-            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
-                -VariableName "DATAVERSE_URL" -VariableValue $env.Url
 
             # Service account
             $serviceAccountUPN = Get-DataverseServiceAccountUPN `
@@ -2629,8 +2949,40 @@ else {
 
             $script:cachedServiceAccounts += $serviceAccountUPN
 
-            Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
-                -VariableName "DATAVERSESERVICEACCOUNTUPN" -VariableValue $serviceAccountUPN
+            if ($useGitHubEnvironments) {
+                [void](Ensure-GitHubEnvironment `
+                    -Owner $repoOwner `
+                    -Repo $repoName `
+                    -EnvironmentName $env.ShortName `
+                    -EnableApprovals:$enableEnvironmentApprovals `
+                    -RequiredReviewerIds $environmentApprovalReviewerIds)
+
+                # Set GitHub environment variables/secrets (non-sensitive values as variables)
+                Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
+                    -VariableName "AZURE_CLIENT_ID" -VariableValue $creds.ApplicationId
+                Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
+                    -VariableName "AZURE_TENANT_ID" -VariableValue $creds.TenantId
+
+                if ($creds.AuthType -eq 'Secret' -and $creds.ClientSecret) {
+                    Set-GitHubEnvironmentSecret -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
+                        -SecretName "AZURE_CLIENT_SECRET" -SecretValue $creds.ClientSecret
+                }
+
+                Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
+                    -VariableName "DATAVERSE_URL" -VariableValue $env.Url
+
+                Set-GitHubEnvironmentVariable -Owner $repoOwner -Repo $repoName -EnvironmentName $env.ShortName `
+                    -VariableName "DATAVERSESERVICEACCOUNTUPN" -VariableValue $serviceAccountUPN
+            }
+            else {
+                Set-GitHubPrefixedEnvironmentCredentials `
+                    -Owner $repoOwner `
+                    -Repo $repoName `
+                    -EnvironmentName $env.ShortName `
+                    -Credentials $creds `
+                    -DataverseUrl $env.Url `
+                    -ServiceAccountUPN $serviceAccountUPN
+            }
 
             # Create Dataverse app user
             Ensure-DataverseApplicationUser -EnvironmentUrl $env.Url -ApplicationId $creds.ApplicationId -TenantId $TenantId

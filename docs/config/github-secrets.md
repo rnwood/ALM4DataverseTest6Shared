@@ -24,6 +24,27 @@ See [GitHub Setup Guide](../setup/github-setup.md) for detailed configuration st
 
 ---
 
+## Automated setup behavior (`setup-github.ps1`)
+
+`setup-github.ps1` automatically detects whether the selected repository supports
+GitHub environment approvals and configures credentials accordingly:
+
+- **Environment mode** (approvals available)
+  - Creates/updates GitHub environments (for example `Dev-main`, `TEST`, `PROD`)
+  - Stores credentials in those environments
+  - Configures required reviewers on each environment
+  - Generates deploy stages with `promotion-mode: environment-approval`
+
+- **Fallback mode** (approvals unavailable)
+  - Stores credentials as prefixed repository-level secrets/variables
+  - Uses derived prefixes such as `DEV_MAIN_`, `TEST_`, `PROD_` (or `PREFIX_`)
+  - Generates deploy stages with `promotion-mode: manual-gate-tag`
+
+You can still change either mode manually after setup by editing your workflow YAML
+and credential locations.
+
+---
+
 ## Approach 1: Workload Identity Federation (OIDC)
 
 Store the following in each GitHub environment (Settings > Environments > {Environment Name}).

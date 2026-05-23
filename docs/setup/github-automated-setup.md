@@ -5,6 +5,14 @@
 The `setup-github.ps1` script automates the GitHub Actions setup for ALM4Dataverse.
 It mirrors the same automation available for Azure DevOps (`setup-azdo.ps1`).
 
+The script automatically detects whether the selected repository supports GitHub
+Environments **with approval rules**. It then chooses the matching setup strategy:
+
+- **Environment mode** (when available): configures GitHub environments, required
+  reviewers, and uses `promotion-mode: environment-approval` in `DEPLOY-{branch}.yml`.
+- **Fallback mode** (when unavailable): configures prefixed repo-level
+  secrets/variables and uses `promotion-mode: manual-gate-tag`.
+
 ---
 
 ## Limitations
@@ -17,6 +25,9 @@ It mirrors the same automation available for Azure DevOps (`setup-azdo.ps1`).
 - You will be prompted to choose between two authentication types per environment:
   - **Workload Identity Federation (recommended)**: No secrets to manage or rotate.
   - **Service Principal with Secret (traditional)**: Uses a client secret that expires.
+- On repository/plan combinations where environment approval rules are unavailable,
+   setup automatically falls back to prefixed repo-level credentials and tag-gated
+   promotion mode.
 
 ---
 
@@ -77,12 +88,17 @@ the selected App Registration and grant it the **System Administrator** role.
    and pushes them. `DEPLOY-main.yml` is renamed to match your default branch.
 5. **Configures solutions** — connects to your Dataverse DEV environment, lists unmanaged
    solutions, lets you select them in dependency order, and updates `alm-config.psd1`.
-6. **Sets up the Dev environment** — creates a GitHub environment named `Dev-{branch}`,
-   creates or reuses an Entra ID App Registration, optionally configures a WIF federated
-   credential, sets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `DATAVERSE_URL`, and
-   `DATAVERSESERVICEACCOUNTUPN` in the environment, and creates the Dataverse application user.
-7. **Sets up each deployment environment** — repeats step 6 for every environment you add
-   (TEST-main, PROD, UAT, etc.).
+6. **Detects repository deployment capability** — checks whether GitHub environment approval
+   rules are available for the selected repository.
+7. **Sets up Dev credentials** — creates or reuses an Entra ID App Registration, optionally
+   configures a WIF federated credential, and then:
+   - stores credentials in a GitHub environment (`Dev-{branch}`) **when environment mode is available**, or
+   - stores credentials as prefixed repo-level secrets/variables (for example `DEV_MAIN_*`) **in fallback mode**.
+8. **Sets up deployment environment credentials** — repeats step 7 for each deployment
+   environment you add (TEST-main, PROD, UAT, etc.), including environment approvals when supported.
+9. **Generates deployment promotion mode automatically** — writes `DEPLOY-{branch}.yml`
+   with `promotion-mode: environment-approval` in environment mode, otherwise
+   `promotion-mode: manual-gate-tag`.
 
 ---
 
@@ -92,13 +108,17 @@ After the script completes:
 
 1. Go to **Actions** in your repository — the `BUILD`, `EXPORT`, `IMPORT`, and `DEPLOY-main`
    workflows are ready.
-2. If you want environment protection rules (required reviewers, wait timer) on TEST or PROD,
-   go to **Settings** > **Environments** and configure them.
-   See [GitHub licence limitations](github-setup.md#github-licence-limitations) for details.
-3. Review the `DEPLOY-{branch}.yml` workflow in your repository.
-   The default uses **Strategy A** (GitHub Free — manual re-trigger + gate tags).
-   If you have GitHub Pro/Team/Enterprise and want auto-chained approvals, switch to Strategy B
-   as described in the [GitHub Actions Setup Guide](github-setup.md#deployment-gates-for-github-free).
+2. Review the selected credential storage location:
+   - **Environment mode**: credentials are in **Settings** > **Environments** > `{EnvironmentName}`
+   - **Fallback mode**: credentials are in **Settings** > **Secrets and variables** > **Actions**
+     with environment-derived prefixes (for example `DEV_MAIN_*`, `TEST_*`, `PROD_*`).
+3. If environment mode was selected, verify required reviewers on each environment in
+   **Settings** > **Environments**.
+4. Review `DEPLOY-{branch}.yml` and confirm the generated `promotion-mode`:
+   - `environment-approval` when environment approvals are available
+   - `manual-gate-tag` when fallback mode is used
+   See [Deployment Gates for GitHub Free](github-setup.md#deployment-gates-for-github-free)
+   and [GitHub licence limitations](github-setup.md#github-licence-limitations) for details.
 
 ---
 

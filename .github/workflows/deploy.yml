@@ -44,58 +44,74 @@ name: Deploy to Environment
 #      rules (see docs/setup/github-setup.md for details).
 #
 # DEPLOYMENT GATES (GitHub Free compatible):
-#   Use required-gate-tag and success-gate-tag to enforce ordered deployments
-#   without environment protection rules.  See docs/setup/github-setup.md.
+#   Gate tags are computed automatically by this workflow from:
+#   - environment-name
+#   - previous-environment-name
+#   - resolved build run id
+#   See docs/setup/github-setup.md.
 
 on:
   workflow_call:
     inputs:
       environment-name:
+        required: true
+        type: string
+        description: >
+          Name of the deployment environment (e.g. "TEST-main", "UAT-main", "PROD").
+          Must match the name of the GitHub environment when using the GitHub
+          Environments approach.
+      previous-environment-name:
         required: false
         type: string
         default: ''
         description: >
-          Optional name of the deployment environment (e.g. "TEST-main", "UAT-main", "PROD").
-          Defaults to Dev-{branch} when omitted.
-          Must match the name of the GitHub environment when using the GitHub
-          Environments approach.  GitHub creates the environment automatically if it
-          does not yet exist (with no protection rules).
-      build-run-id:
+          Previous stage environment in the promotion chain.
+          Leave empty for the first stage.
+          In manual-gate-tag mode this is used to compute the required gate tag
+          automatically: deployed/{previous-environment-name}/{build-run-id}.
+      promotion-mode:
+        required: false
+        type: string
+        default: manual-gate-tag
+        description: >
+          Promotion strategy.
+          - manual-gate-tag: only first stage auto-runs; higher stages are manual
+            and must prove previous stage success using computed gate tags.
+          - environment-approval: stages can auto-chain via caller `needs` and
+            GitHub environment protection rules.
+      github-context-json:
         required: true
         type: string
         description: >
-          The GitHub Actions run ID of the BUILD workflow run whose artifacts should
-          be deployed.  Typically github.event.workflow_run.id when triggered
-          by a workflow_run event, or a user-supplied value for manual dispatch.
-      required-gate-tag:
+          toJSON(github) from the caller workflow.
+          Used to resolve trigger type and workflow_run details.
+      caller-inputs-json:
+        required: true
         type: string
-        default: ''
         description: >
-          Git tag that must exist in this repository before deployment proceeds.
-          If set and the tag is absent the workflow fails immediately with a clear
-          error message.  Use the success-gate-tag from a previous environment's
-          deployment job to enforce ordered promotion without environment protection
-          rules (GitHub Free compatible).
-          Recommended format: deployed/{previous-environment-name}/{build-run-id}
-          Example: deployed/TEST-main/9876543210
-      success-gate-tag:
-        type: string
-        default: ''
-        description: >
-          Git tag to push after this deployment completes successfully.
-          Other DEPLOY workflows reference it as their required-gate-tag to prove
-          this stage was successfully completed before they proceed.
-          Recommended format: deployed/{environment-name}/{build-run-id}
-          Example: deployed/TEST-main/9876543210
-          Requires the calling workflow job to have contents: write permission.
+          toJSON(inputs) from the caller workflow.
+          Used to resolve workflow_dispatch inputs such as build-run-id and
+          target-environment.
 
 jobs:
   deploy:
+    if: >-
+      (
+        fromJSON(inputs.github-context-json).event_name == 'workflow_run' &&
+        fromJSON(inputs.github-context-json).event.workflow_run.conclusion == 'success' &&
+        (
+          inputs.previous-environment-name == '' ||
+          inputs.promotion-mode == 'environment-approval'
+        )
+      ) || (
+        fromJSON(inputs.github-context-json).event_name == 'workflow_dispatch' &&
+        fromJSON(inputs.caller-inputs-json)['target-environment'] == inputs.environment-name
+      )
     runs-on: windows-latest
-    environment: ${{ inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name) }}
+    environment: ${{ inputs.environment-name }}
     permissions:
       actions: read    # required to download artifacts from another workflow run
-      contents: write  # required to push success-gate-tag after deployment
+      contents: write  # required to push success gate tag after deployment
       id-token: write  # request OIDC token for Workload Identity Federation
     env:
       AZURE_CLIENT_ID:     ${{ vars.AZURE_CLIENT_ID }}
@@ -109,15 +125,88 @@ jobs:
       DATAVERSE_ENV_VARS:        ${{ vars.DATAVERSE_ENV_VARS }}
 
     steps:
+      - name: Resolve deployment execution context
+        id: resolve
+        shell: pwsh
+        env:
+          INPUT_ENVIRONMENT_NAME: ${{ inputs.environment-name }}
+          INPUT_PREVIOUS_ENVIRONMENT_NAME: ${{ inputs.previous-environment-name }}
+          INPUT_PROMOTION_MODE: ${{ inputs.promotion-mode }}
+          INPUT_GITHUB_CONTEXT_JSON: ${{ inputs.github-context-json }}
+          INPUT_CALLER_INPUTS_JSON: ${{ inputs.caller-inputs-json }}
+        run: |
+          $environmentName = $env:INPUT_ENVIRONMENT_NAME.Trim()
+          $previousName    = $env:INPUT_PREVIOUS_ENVIRONMENT_NAME.Trim()
+          $promotionMode   = $env:INPUT_PROMOTION_MODE.Trim()
+
+          try {
+            $githubContext = $env:INPUT_GITHUB_CONTEXT_JSON | ConvertFrom-Json -Depth 100
+          } catch {
+            throw "github-context-json is not valid JSON."
+          }
+
+          try {
+            $callerInputs = $env:INPUT_CALLER_INPUTS_JSON | ConvertFrom-Json -Depth 50
+          } catch {
+            throw "caller-inputs-json is not valid JSON."
+          }
+
+          $eventName     = [string]$githubContext.event_name
+          $conclusion    = [string]$githubContext.event.workflow_run.conclusion
+          $workflowRunId = [string]$githubContext.event.workflow_run.id
+          $manualRunId   = [string]$callerInputs.'build-run-id'
+          $targetEnv     = [string]$callerInputs.'target-environment'
+
+          if ($promotionMode -notin @('manual-gate-tag', 'environment-approval')) {
+            throw "Unsupported promotion-mode '$promotionMode'. Use 'manual-gate-tag' or 'environment-approval'."
+          }
+
+          switch ($eventName) {
+            'workflow_run' {
+              $buildRunId = $workflowRunId
+            }
+            'workflow_dispatch' {
+              $buildRunId = $manualRunId
+            }
+            default {
+              throw "Unsupported trigger-event-name '$eventName'."
+            }
+          }
+
+          if ($eventName -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($targetEnv)) {
+            throw "workflow_dispatch requires caller inputs to include 'target-environment'."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($buildRunId)) {
+            throw "Resolved BUILD run ID is empty for event '$eventName'."
+          }
+
+          $requiredGateTag = ''
+          if ($promotionMode -eq 'manual-gate-tag' -and -not [string]::IsNullOrWhiteSpace($previousName)) {
+            $requiredGateTag = "deployed/$previousName/$buildRunId"
+          }
+
+          $successGateTag = "deployed/$environmentName/$buildRunId"
+
+          "build_run_id=$buildRunId"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "required_gate_tag=$requiredGateTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "success_gate_tag=$successGateTag"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "event_name=$eventName"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "target_environment=$targetEnv"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Resolved build run id: $buildRunId"
+          Write-Host "Resolved required gate tag: $requiredGateTag"
+          Write-Host "Resolved success gate tag: $successGateTag"
+
       - name: Check deployment gate tag
-        if: inputs.required-gate-tag != ''
+        if: steps.resolve.outputs.required_gate_tag != ''
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           # Verify the previous environment's success-gate-tag exists before proceeding.
           # This enforces ordered deployment promotion without environment protection rules.
-          $gateTag    = '${{ inputs.required-gate-tag }}'
+          $gateTag    = '${{ steps.resolve.outputs.required_gate_tag }}'
           $encodedTag = [Uri]::EscapeDataString($gateTag)
           $apiBase    = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)"
           $headers    = @{
@@ -146,7 +235,7 @@ jobs:
         uses: actions/download-artifact@v4.1.3
         with:
           name: artifacts
-          run-id: ${{ inputs.build-run-id }}
+          run-id: ${{ steps.resolve.outputs.build_run_id }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           path: artifacts
@@ -156,7 +245,7 @@ jobs:
         env:
           ALL_REPO_VARS_JSON: ${{ toJSON(vars) }}
           ALL_REPO_SECRETS_JSON: ${{ toJSON(secrets) }}
-          RESOLVED_ENVIRONMENT_NAME: ${{ inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name) }}
+          RESOLVED_ENVIRONMENT_NAME: ${{ inputs.environment-name }}
         run: |
           function ConvertTo-HashtableSafe([string]$jsonText) {
             if ([string]::IsNullOrWhiteSpace($jsonText)) {
@@ -353,7 +442,7 @@ jobs:
           & "./alm/pipelines/scripts/deploy.ps1" -ArtifactsPath "."
 
       - name: Push success gate tag
-        if: inputs.success-gate-tag != ''
+        if: steps.resolve.outputs.success_gate_tag != ''
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -361,8 +450,8 @@ jobs:
           # Record a permanent, auditable marker that this environment was successfully
           # deployed for this build.  The next environment's workflow checks for this
           # tag via required-gate-tag before it is allowed to proceed.
-          $successTag = '${{ inputs.success-gate-tag }}'
-          $buildRunId = '${{ inputs.build-run-id }}'
+          $successTag = '${{ steps.resolve.outputs.success_gate_tag }}'
+          $buildRunId = '${{ steps.resolve.outputs.build_run_id }}'
           $apiBase    = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)"
           $headers    = @{
             Authorization = "Bearer $($env:GITHUB_TOKEN)"
