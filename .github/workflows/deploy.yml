@@ -240,6 +240,31 @@ jobs:
           repository: ${{ github.repository }}
           path: artifacts
 
+      - name: Resolve dependency cache keys
+        id: dependency-cache
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          & "./alm/pipelines/scripts/resolvedependencycache.ps1" `
+            -BaseDirectory "." `
+            -AlmScriptsRoot "./alm/pipelines/scripts"
+
+      - name: Cache PowerShell modules
+        if: steps.dependency-cache.outputs.module_cache_enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          key: ${{ steps.dependency-cache.outputs.module_cache_key }}
+          path: |
+            ~\Documents\PowerShell\Modules
+            ~\Documents\WindowsPowerShell\Modules
+
+      - name: Cache PAC CLI
+        if: steps.dependency-cache.outputs.pac_cache_enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          key: ${{ steps.dependency-cache.outputs.pac_cache_key }}
+          path: ~\.alm4dataverse\tools
+
       - name: Resolve prefixed repo variables and secrets
         shell: pwsh
         env:
