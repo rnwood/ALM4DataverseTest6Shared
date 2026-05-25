@@ -678,7 +678,8 @@ function Ensure-GitHubEnvironment {
     # Check if environment already exists
     $existing = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -AllowNotFound
 
-    $body = @{ wait_timer = 0 }
+    $body = $null
+    $appliedApprovals = $false
     if ($EnableApprovals) {
         $reviewers = @()
         foreach ($reviewerId in @($RequiredReviewerIds)) {
@@ -688,15 +689,24 @@ function Ensure-GitHubEnvironment {
         }
 
         if ($reviewers.Count -gt 0) {
-            $body.reviewers = $reviewers
+            $body = @{ reviewers = $reviewers }
+            $appliedApprovals = $true
+        }
+        else {
+            Write-Host "Approvals were requested but no valid reviewer IDs were supplied; configuring environment without required reviewers." -ForegroundColor Yellow
         }
     }
 
     $action = if ($existing) { 'Updating' } else { 'Creating' }
     Write-Host "$action environment '$EnvironmentName'..." -ForegroundColor Yellow
-    $updated = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -Method 'PUT' -Body $body
+    if ($body) {
+        $updated = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -Method 'PUT' -Body $body
+    }
+    else {
+        $updated = Invoke-GhApi -Endpoint "repos/$Owner/$Repo/environments/$([Uri]::EscapeDataString($EnvironmentName))" -Method 'PUT'
+    }
 
-    if ($EnableApprovals) {
+    if ($appliedApprovals) {
         Write-Host "Configured environment '$EnvironmentName' with required reviewers." -ForegroundColor DarkGray
     }
     else {
@@ -840,25 +850,29 @@ function Get-GitHubEnvironmentCapabilities {
     }
 
     try {
-        [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT' -Body @{ wait_timer = 0 })
+        # Probe base environment availability without optional protection rules.
+        [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT')
         $result.EnvironmentsAvailable = $true
-
-        if ($ApprovalReviewerId -gt 0) {
-            try {
-                [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT' -Body @{ wait_timer = 0; reviewers = @(@{ type = 'User'; id = $ApprovalReviewerId }) })
-                $result.ApprovalsAvailable = $true
-                $result.Message = 'GitHub environments and approval rules are available.'
-            }
-            catch {
-                $result.Message = "GitHub environments are available, but approval rules are not available for this repository: $($_.Exception.Message)"
-            }
-        }
-        else {
-            $result.Message = 'GitHub environments are available, but no reviewer id was provided for approval-rule probing.'
-        }
     }
     catch {
         $result.Message = "GitHub environments are not available for this repository: $($_.Exception.Message)"
+    }
+
+    if ($result.EnvironmentsAvailable) {
+        if ($ApprovalReviewerId -gt 0) {
+            try {
+                # Probe required-reviewer availability separately from base environments support.
+                [void](Invoke-GhApi -Endpoint $probeEndpoint -Method 'PUT' -Body @{ reviewers = @(@{ type = 'User'; id = $ApprovalReviewerId }) })
+                $result.ApprovalsAvailable = $true
+                $result.Message = 'GitHub environments and required reviewers are available.'
+            }
+            catch {
+                $result.Message = "GitHub environments are available, but required reviewers are not available for this repository: $($_.Exception.Message)"
+            }
+        }
+        else {
+            $result.Message = 'GitHub environments are available, but required-reviewer support could not be probed because no reviewer id was provided.'
+        }
     }
     finally {
         try {
@@ -2674,21 +2688,26 @@ $enableEnvironmentApprovals = $false
 $environmentApprovalReviewerIds = @()
 $deploymentPromotionMode = 'manual-gate-tag'
 
-Write-Host "Checking GitHub environment and approval-rule availability for '$repoFullName'..." -ForegroundColor Yellow
+Write-Host "Checking GitHub environment and required-reviewer availability for '$repoFullName'..." -ForegroundColor Yellow
 $environmentCapabilities = Get-GitHubEnvironmentCapabilities -Owner $repoOwner -Repo $repoName -ApprovalReviewerId $script:ghUserId
 
-if ($environmentCapabilities.EnvironmentsAvailable -and $environmentCapabilities.ApprovalsAvailable) {
+if ($environmentCapabilities.EnvironmentsAvailable) {
     $useGitHubEnvironments = $true
-    $enableEnvironmentApprovals = $true
-    $deploymentPromotionMode = 'environment-approval'
-    if ($script:ghUserId) {
-        $environmentApprovalReviewerIds = @($script:ghUserId)
-    }
+    if ($environmentCapabilities.ApprovalsAvailable) {
+        $enableEnvironmentApprovals = $true
+        $deploymentPromotionMode = 'environment-approval'
+        if ($script:ghUserId) {
+            $environmentApprovalReviewerIds = @($script:ghUserId)
+        }
 
-    Write-Host "GitHub environments with approvals are available. Setup will configure environment credentials and approval gates." -ForegroundColor Green
+        Write-Host "GitHub environments and required reviewers are available. Setup will configure environment credentials and approval gates." -ForegroundColor Green
+    }
+    else {
+        Write-Host "GitHub environments are available, but required reviewers are unavailable. Setup will use environment-scoped credentials and tag-based promotion." -ForegroundColor Yellow
+    }
 }
 else {
-    Write-Host "GitHub environments with approvals are unavailable for this repository. Setup will use prefixed repo-level credentials and tag-based promotion." -ForegroundColor Yellow
+    Write-Host "GitHub environments are unavailable for this repository. Setup will use prefixed repo-level credentials and tag-based promotion." -ForegroundColor Yellow
 }
 
 if (-not [string]::IsNullOrWhiteSpace($environmentCapabilities.Message)) {
