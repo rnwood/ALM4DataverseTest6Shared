@@ -38,7 +38,7 @@ GitHub environment approvals and configures credentials accordingly:
 - **Fallback mode** (approvals unavailable)
   - Stores credentials as prefixed repository-level secrets/variables
   - Uses derived prefixes such as `DEV_MAIN_`, `TEST_`, `PROD_` (or `PREFIX_`)
-  - Generates deploy stages with `promotion-mode: manual-gate-tag`
+  - Generates deploy stages with `promotion-mode: manual-gate-tag` and manual dispatch from stage 1 onward
 
 You can still change either mode manually after setup by editing your workflow YAML
 and credential locations.

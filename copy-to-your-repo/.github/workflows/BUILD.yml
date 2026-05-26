@@ -6,6 +6,8 @@ name: BUILD
 #
 # See docs/usage/building-releases.md and docs/setup/github-setup.md
 
+run-name: ${{ github.ref_name }}-${{ github.run_number }}
+
 on:
   push:
     branches:

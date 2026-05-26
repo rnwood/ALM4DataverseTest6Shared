@@ -131,7 +131,7 @@ your-repo/
 │       ├── BUILD.yml
 │       ├── EXPORT.yml
 │       ├── IMPORT.yml
-│       └── DEPLOY-main.yml   ← all environments; auto for TEST, manual for higher stages
+│       └── DEPLOY-main.yml   ← all environments; manual from stage 1 by default
 ├── alm-config.psd1
 └── data/
 ```
@@ -156,9 +156,10 @@ Edit `alm-config.psd1` to list the solutions you want to manage:
 To configure it, edit only:
 
 - each stage's `promotion-mode` value:
-  - `manual-gate-tag` (GitHub Free compatible; manual promotion + gate tag)
+  - `manual-gate-tag` (GitHub Free compatible; manual deployment + gate tag)
   - `environment-approval` (auto-chain after previous stage success; relies on environment protection rules)
-- `workflow_dispatch.inputs.target-environment.options`
+- the `workflow_run` trigger **only when using** `environment-approval`
+- `workflow_dispatch.inputs.target-environment`
 - the `deploy-*` jobs (one per environment, with `needs` chaining)
 - keep the context payload lines unchanged in each stage:
   - `github-context-json: ${{ toJSON(github) }}`
@@ -172,15 +173,14 @@ repository capability detection:
 
 Behavior remains simple:
 
-- **Automatic**: when BUILD succeeds on `main`, the first stage runs (typically TEST).
-- **Manual**: go to **Actions** > **DEPLOY-main** > **Run workflow**, provide
-  `build-run-id`, and choose `target-environment` (for example `PROD`).
+- **`manual-gate-tag`**: every stage is triggered manually from **Actions** > **DEPLOY-main** > **Run workflow**, and `target-environment` remains mandatory.
+- **`environment-approval`**: when BUILD succeeds on `main`, stage 1 starts automatically and later stages auto-chain only after the previous stage succeeds and any environment approval rules pass. For a manual replay, `target-environment` can be left blank to start from the first configured stage, or set to a specific environment name to jump directly to that stage.
 
 See [Deployment Gates for GitHub Free](#deployment-gates-for-github-free).
 
 If your default branch is not `main`:
 - Rename `DEPLOY-main.yml` to `DEPLOY-{branchname}.yml`
-- Update the `branches:` filter in the `workflow_run` trigger
+- Update the `branches:` filter in the `workflow_run` trigger (if present)
 
 ### Workflow job timeouts
 
@@ -293,7 +293,7 @@ jobs:
 
   deploy-prod:
     needs: deploy-test
-    if: ${{ always() }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs['deploy-test'].result == 'success' }}
     uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
     with:
       environment-name: PROD
@@ -310,7 +310,7 @@ To switch promotion strategy, change only:
 promotion-mode: manual-gate-tag   # or environment-approval
 ```
 
-- `manual-gate-tag` (default): manual promotion for higher environment(s), gate tags enforced.
+- `manual-gate-tag` (default): every stage requires a manual trigger; higher environment(s) must also satisfy the previous-stage gate tag.
 - `environment-approval`: auto-chain to each next stage; approval handled by
   GitHub environment protection rules.
 
@@ -449,32 +449,35 @@ deployments without using any time-limited construct.
 ### How it works
 
 ```
-BUILD (auto) → DEPLOY-main auto-run (TEST stage) → [human decision] → DEPLOY-main manual-run (PROD stage)
+BUILD (auto) → [human decision] → DEPLOY-main manual-run (TEST stage) → [human decision] → DEPLOY-main manual-run (PROD stage)
 ```
 
 1. **BUILD** runs automatically on every push to `main`.
-2. **DEPLOY-main** auto-triggers when BUILD succeeds and deploys to the configured
-  **first stage environment** (typically `TEST-main`).
-   On success it pushes a lightweight git tag:
+2. A team member manually triggers **DEPLOY-main** by going to **Actions** > **DEPLOY-main** > **Run workflow**, entering the BUILD run name shown in the Actions UI (for example `main-562`), and setting `target-environment` to the desired stage (for example `TEST-main`).
+3. When the selected stage succeeds it pushes two lightweight git tags:
    ```
-   deployed/TEST-main/{build-run-id}
+  {build-run-name}/deployed/TEST-main
+  deployed/TEST-main
    ```
-3. A team member inspects the TEST deployment, then manually triggers **DEPLOY-main**
-   again by going to **Actions** > **DEPLOY-main** > **Run workflow**, entering the
-  BUILD run ID, and setting `target-environment` to the desired next stage.
-4. In `manual-gate-tag` mode, the selected stage checks via the GitHub API whether
-  the previous stage gate tag exists (`deployed/{previous-environment}/{build-run-id}`).
+4. After inspecting that deployment, a team member manually triggers **DEPLOY-main** again for the desired next stage.
+5. In `manual-gate-tag` mode, the selected stage checks via the GitHub API whether
+  the previous stage gate tag exists (`{build-run-name}/deployed/{previous-environment}`).
    If it doesn't — because TEST never succeeded for that build — the workflow
    **fails immediately** with a clear error:
-   > *Deployment gate check FAILED: the tag `deployed/TEST-main/12345678` does not exist.
+  > *Deployment gate check FAILED: the tag `main-562/deployed/TEST-main` does not exist.
    > Deploy to the previous environment first, then re-trigger this workflow.*
-5. If the tag is present, deployment proceeds and on success pushes:
+6. If the tag is present, deployment proceeds and on success pushes:
    ```
-   deployed/PROD/{build-run-id}
+  {build-run-name}/deployed/PROD
+  deployed/PROD
    ```
 
 The gate tags serve as a **permanent, auditable trail** of which build was deployed
 to which environment and in what order.
+
+The `deployed/{environment}` tag is a **movable pointer** that is updated on every
+successful deployment, making it easy to see the build currently live in each
+environment.
 
 ### Key properties
 
@@ -482,7 +485,7 @@ to which environment and in what order.
 |---|---|
 | No time limits | Gate tags are permanent — they don't expire |
 | Ordered promotion enforced | Cannot deploy to a later stage without successful deployment of the previous stage for the same build |
-| No automatic cascade (manual mode) | Higher stage jobs only run when manually triggered with the right `target-environment` selection |
+| Targeted redeploy supported | Enter `target-environment` explicitly to deploy a specific stage |
 | Single workflow file | Everything lives in `DEPLOY-main.yml` — no extra files to manage |
 | GitHub Free compatible | Uses only `contents: write` permission and the GitHub REST API |
 | Works with all credential approaches | WIF, client secret, or prefixed global secrets |
@@ -517,8 +520,9 @@ BUILD (auto) → stage 1 (auto) → stage 2 (queued/approval) → stage 3 (queue
 ```
 
 In this mode, each stage runs only after the previous stage succeeds on automatic runs.
-For manual runs, you can still deploy directly to a specific stage by setting
-`target-environment`.
+For manual runs, you can leave `target-environment` blank to start from the first
+configured stage in `environment-approval` mode, or set it to deploy directly to a
+specific stage.
 
 ---
 
@@ -548,11 +552,10 @@ On a **private repository with GitHub Free**:
 **Additional access controls on Free plan:**
 
 - Use branch protection rules on `main` to restrict who can merge/push, which
-  indirectly controls who can trigger automatic deployments via the `workflow_run`
-  trigger.
+  controls which builds are available for promotion.
 - Restrict `workflow_dispatch` permission using repository collaborator roles —
-  only users with at least **Write** access can trigger manual workflows like
-  later-stage targets in `DEPLOY-main.yml`.
+  only users with at least **Write** access can trigger manual deployments in
+  `DEPLOY-main.yml`.
 - Consider upgrading to GitHub Pro/Team for production workloads requiring formal
   approval workflows.
 
@@ -560,10 +563,11 @@ On a **private repository with GitHub Free**:
 
 ## Grant permissions for workflow operations
 
-### Write access for EXPORT and DEPLOY gate tags
+### Write access for EXPORT and DEPLOY tags
 
 The EXPORT workflow commits and pushes solution changes back to the repository.
-The DEPLOY workflows push git tag gates after successful deployments.
+The DEPLOY workflows push git tag gates and environment pointer tags after
+successful deployments.
 
 1. Go to **Settings** > **Actions** > **General**
 2. Under **Workflow permissions**, select **Read and write permissions**
@@ -587,23 +591,31 @@ Once configured:
 - **BUILD** — runs automatically on every push. View run status in the **Actions** tab.
 - **EXPORT** — go to **Actions** > **EXPORT** > **Run workflow**, enter a commit message, and click **Run workflow**.
 - **IMPORT** — go to **Actions** > **IMPORT** > **Run workflow** and click **Run workflow**.
-- **DEPLOY-main** — runs automatically when BUILD succeeds on `main`, deploying to the first configured stage (typically `TEST-main`). To deploy to a later stage, go to **Actions** > **DEPLOY-main** > **Run workflow**, set `target-environment` (for example `PROD`), enter the BUILD run ID, and click **Run workflow**. In `manual-gate-tag` mode, the workflow verifies the previous stage's gate tag before proceeding.
+- **DEPLOY-main** — enter the BUILD run name and `target-environment` for `manual-gate-tag` mode. In `environment-approval` mode, stage 1 starts automatically after BUILD succeeds and later stages auto-chain after prior-stage success plus any required approvals; for a manual replay, `target-environment` can be left blank to start from the first configured stage, while entering a value targets a specific stage.
 
-### Finding a BUILD run ID for manual deploy
+### Finding a BUILD run name for manual deploy
 
 1. Go to **Actions** and select the **BUILD** workflow
-2. Click the run you want to deploy
-3. The run ID is visible in the URL: `github.com/{owner}/{repo}/actions/runs/{run-id}`
+2. Find the run title in the list or open the run and copy the name shown at the top (for example `main-562`)
+3. Enter that run name into **DEPLOY-main** when triggering a manual deployment
 
-### Viewing deployment gate tags
+For backward compatibility, numeric run IDs from the run URL are still accepted too.
 
-Gate tags are stored in the repository and are visible in the **Tags** section of the
-repository (under **Code** > **Tags**).  Each tag records which environment received
-which build:
+### Viewing deployment tags
+
+Deployment tags are stored in the repository and are visible in the **Tags** section
+of the repository (under **Code** > **Tags**).
+
+- `{build-run-name}/deployed/{environment}` is the permanent audit/gate tag.
+- `deployed/{environment}` is the movable pointer showing what is currently deployed.
+
+Example:
 
 ```
-deployed/TEST-main/12345678   ← TEST was successfully deployed for build 12345678
-deployed/PROD/12345678        ← PROD was successfully deployed for build 12345678
+main-562/deployed/TEST-main   ← TEST was successfully deployed for build main-562
+main-562/deployed/PROD        ← PROD was successfully deployed for build main-562
+deployed/TEST-main            ← TEST currently points at build main-562
+deployed/PROD                 ← PROD currently points at build main-562
 ```
 
 ---

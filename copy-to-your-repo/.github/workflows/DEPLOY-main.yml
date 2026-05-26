@@ -8,8 +8,11 @@ name: DEPLOY-main
 #   3. Set `promotion-mode` on each stage (or keep the default):
 #      - manual-gate-tag      (GitHub Free compatible)
 #      - environment-approval (auto-chain with environment approvals)
+#   4. Add the `workflow_run` trigger only when using environment-approval.
 #
 # See docs/setup/github-setup.md
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Deploy {0} <- {1}', github.event.inputs['target-environment'], github.event.inputs['build-run-name'] || github.event.inputs['build-run-id']) || format('Deploy auto <- {0}', github.event.workflow_run.display_title || github.event.workflow_run.id) }}
 
 permissions:
   actions: read
@@ -17,14 +20,10 @@ permissions:
   id-token: write
 
 on:
-  workflow_run:
-    workflows: ['BUILD']
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
-      build-run-id:
-        description: 'BUILD workflow run ID to deploy (find in Actions tab)'
+      build-run-name:
+        description: 'BUILD run name to deploy (for example main-562). Numeric run IDs also work.'
         required: true
         type: string
       target-environment:
@@ -36,10 +35,16 @@ on:
           - PROD
           # Add further environments here (UAT, STAGING, etc.) as needed.
           # Each option should have a matching deploy-* job below.
+  # Add this trigger when using `promotion-mode: environment-approval`:
+  # workflow_run:
+  #   workflows: ['BUILD']
+  #   types: [completed]
+  #   branches: [main]
 
 jobs:
   deploy-test:
     # First stage in the chain.
+    # In manual-gate-tag mode this stage is manual too.
     uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
     permissions:
       actions: read
@@ -56,10 +61,10 @@ jobs:
 
   deploy-prod:
     # Higher stage example.
-    # Keep `if: always()` so manual promotion can still run even when prior jobs
-    # are skipped by stage-selection logic in the reusable workflow.
+    # Allow manual targeted deploys even when prior jobs are skipped in this run,
+    # but do not bypass failed prerequisite stages on automatic runs.
     needs: deploy-test
-    if: ${{ always() }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs['deploy-test'].result == 'success' }}
     uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/deploy.yml@stable
     permissions:
       actions: read

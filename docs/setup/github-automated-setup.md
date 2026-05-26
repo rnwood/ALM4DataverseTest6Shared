@@ -11,7 +11,7 @@ Environments **with approval rules**. It then chooses the matching setup strateg
 - **Environment mode** (when available): configures GitHub environments, required
   reviewers, and uses `promotion-mode: environment-approval` in `DEPLOY-{branch}.yml`.
 - **Fallback mode** (when unavailable): configures prefixed repo-level
-  secrets/variables and uses `promotion-mode: manual-gate-tag`.
+   secrets/variables and uses `promotion-mode: manual-gate-tag` with manual deploys from stage 1 onward.
 
 ---
 
@@ -98,7 +98,10 @@ the selected App Registration and grant it the **System Administrator** role.
    environment you add (TEST-main, PROD, UAT, etc.), including environment approvals when supported.
 9. **Generates deployment promotion mode automatically** — writes `DEPLOY-{branch}.yml`
    with `promotion-mode: environment-approval` in environment mode, otherwise
-   `promotion-mode: manual-gate-tag`.
+   `promotion-mode: manual-gate-tag` (manual trigger required for every stage).
+   Generated `environment-approval` DEPLOY workflows also allow `target-environment`
+   to be left blank for manual replays, which starts from the first configured stage.
+   In `manual-gate-tag` mode, `target-environment` remains mandatory.
 10. **Applies workflow timeout defaults** — configures workflow calls to pass
     `timeout-minutes: 360` (matching Azure DevOps template defaults) for BUILD,
     EXPORT, IMPORT, and each DEPLOY stage.
@@ -120,6 +123,7 @@ After the script completes:
 4. Review `DEPLOY-{branch}.yml` and confirm the generated `promotion-mode`:
    - `environment-approval` when environment approvals are available
    - `manual-gate-tag` when fallback mode is used
+   (every deployment stage is triggered manually; later stages also require the previous stage's success tag)
    See [Deployment Gates for GitHub Free](github-setup.md#deployment-gates-for-github-free)
    and [GitHub licence limitations](github-setup.md#github-licence-limitations) for details.
 

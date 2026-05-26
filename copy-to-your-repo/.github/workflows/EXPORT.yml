@@ -5,6 +5,8 @@ name: EXPORT
 #
 # See docs/usage/exporting-changes.md and docs/setup/github-setup.md
 
+run-name: Export ${{ github.ref_name }} by @${{ github.actor }}
+
 on:
   workflow_dispatch:
     inputs:

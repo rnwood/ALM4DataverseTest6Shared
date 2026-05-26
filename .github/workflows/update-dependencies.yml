@@ -1,5 +1,7 @@
 name: Update Script Dependencies
 
+run-name: ${{ github.event_name == 'schedule' && 'Update dependencies (scheduled)' || format('Update dependencies by @{0}', github.actor) }}
+
 'on':
   schedule:
     # Run daily at 2 AM UTC

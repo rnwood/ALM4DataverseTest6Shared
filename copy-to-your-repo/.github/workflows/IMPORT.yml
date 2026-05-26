@@ -5,6 +5,8 @@ name: IMPORT
 #
 # See docs/usage/importing-changes.md and docs/setup/github-setup.md
 
+run-name: Import ${{ github.ref_name }} by @${{ github.actor }}
+
 on:
   workflow_dispatch:
 

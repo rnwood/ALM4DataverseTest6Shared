@@ -47,7 +47,7 @@ name: Deploy to Environment
 #   Gate tags are computed automatically by this workflow from:
 #   - environment-name
 #   - previous-environment-name
-#   - resolved build run id
+#   - resolved build run name
 #   See docs/setup/github-setup.md.
 
 on:
@@ -68,15 +68,15 @@ on:
           Previous stage environment in the promotion chain.
           Leave empty for the first stage.
           In manual-gate-tag mode this is used to compute the required gate tag
-          automatically: deployed/{previous-environment-name}/{build-run-id}.
+          automatically: {build-run-name}/deployed/{previous-environment-name}.
       promotion-mode:
         required: false
         type: string
         default: manual-gate-tag
         description: >
           Promotion strategy.
-          - manual-gate-tag: only first stage auto-runs; higher stages are manual
-            and must prove previous stage success using computed gate tags.
+          - manual-gate-tag: every stage is manually triggered and higher stages
+            must prove previous stage success using computed gate tags.
           - environment-approval: stages can auto-chain via caller `needs` and
             GitHub environment protection rules.
       github-context-json:
@@ -90,7 +90,7 @@ on:
         type: string
         description: >
           toJSON(inputs) from the caller workflow.
-          Used to resolve workflow_dispatch inputs such as build-run-id and
+          Used to resolve workflow_dispatch inputs such as build-run-name and
           target-environment.
       timeout-minutes:
         required: false
@@ -103,14 +103,17 @@ jobs:
     if: >-
       (
         fromJSON(inputs.github-context-json).event_name == 'workflow_run' &&
-        fromJSON(inputs.github-context-json).event.workflow_run.conclusion == 'success' &&
-        (
-          inputs.previous-environment-name == '' ||
-          inputs.promotion-mode == 'environment-approval'
-        )
+        inputs.promotion-mode == 'environment-approval' &&
+        fromJSON(inputs.github-context-json).event.workflow_run.conclusion == 'success'
       ) || (
         fromJSON(inputs.github-context-json).event_name == 'workflow_dispatch' &&
-        fromJSON(inputs.caller-inputs-json)['target-environment'] == inputs.environment-name
+        (
+          fromJSON(inputs.caller-inputs-json)['target-environment'] == inputs.environment-name ||
+          (
+            inputs.promotion-mode == 'environment-approval' &&
+            fromJSON(inputs.caller-inputs-json)['target-environment'] == ''
+          )
+        )
       )
     runs-on: windows-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
@@ -140,7 +143,101 @@ jobs:
           INPUT_PROMOTION_MODE: ${{ inputs.promotion-mode }}
           INPUT_GITHUB_CONTEXT_JSON: ${{ inputs.github-context-json }}
           INPUT_CALLER_INPUTS_JSON: ${{ inputs.caller-inputs-json }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          function Get-GitHubApiHeaders {
+            return @{
+              Authorization = "Bearer $($env:GITHUB_TOKEN)"
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+          }
+
+          function Invoke-GitHubApi {
+            param([Parameter(Mandatory)][string]$RelativePath)
+
+            $uri = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/$RelativePath"
+            return Invoke-RestMethod -Uri $uri -Headers (Get-GitHubApiHeaders)
+          }
+
+          function Resolve-BuildRunDisplayName {
+            param([Parameter(Mandatory)][object]$Run)
+
+            foreach ($propertyName in @('display_title', 'run_name')) {
+              if ($Run.PSObject.Properties.Name -contains $propertyName) {
+                $value = [string]$Run.$propertyName
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                  return $value.Trim()
+                }
+              }
+            }
+
+            $headBranch = ''
+            if ($Run.PSObject.Properties.Name -contains 'head_branch') {
+              $headBranch = [string]$Run.head_branch
+            }
+
+            $runNumber = ''
+            if ($Run.PSObject.Properties.Name -contains 'run_number') {
+              $runNumber = [string]$Run.run_number
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($headBranch) -and -not [string]::IsNullOrWhiteSpace($runNumber)) {
+              return "$headBranch-$runNumber"
+            }
+
+            return ([string]$Run.id).Trim()
+          }
+
+          function ConvertTo-GateTagSegment {
+            param([Parameter(Mandatory)][string]$Value)
+
+            $sanitized = $Value.Trim()
+            $sanitized = $sanitized -replace '[^a-zA-Z0-9._/-]', '-'
+            $sanitized = $sanitized -replace '-{2,}', '-'
+            $sanitized = $sanitized -replace '\.{2,}', '.'
+            $sanitized = $sanitized -replace '/{2,}', '/'
+            $sanitized = $sanitized.Trim('/', '.', '-')
+
+            if ($sanitized.EndsWith('.lock')) {
+              $sanitized = $sanitized -replace '\.lock$', '-lock'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($sanitized)) {
+              throw "Build run name '$Value' cannot be converted to a valid gate tag segment."
+            }
+
+            return $sanitized
+          }
+
+          function Get-BuildRunById {
+            param([Parameter(Mandatory)][string]$RunId)
+
+            return Invoke-GitHubApi -RelativePath "actions/runs/$RunId"
+          }
+
+          function Find-BuildRunByName {
+            param([Parameter(Mandatory)][string]$RunName)
+
+            for ($page = 1; $page -le 10; $page++) {
+              $response = Invoke-GitHubApi -RelativePath "actions/workflows/BUILD.yml/runs?per_page=100&page=$page"
+              $runs = @($response.workflow_runs)
+              if ($runs.Count -eq 0) {
+                break
+              }
+
+              $match = $runs | Where-Object {
+                (Resolve-BuildRunDisplayName -Run $_) -ieq $RunName
+              } | Select-Object -First 1
+
+              if ($match) {
+                return $match
+              }
+            }
+
+            throw "No BUILD workflow run named '$RunName' was found. Use the BUILD run name shown in the Actions tab (for example 'main-562'), or supply the numeric run ID instead."
+          }
+
           $environmentName = $env:INPUT_ENVIRONMENT_NAME.Trim()
           $previousName    = $env:INPUT_PREVIOUS_ENVIRONMENT_NAME.Trim()
           $promotionMode   = $env:INPUT_PROMOTION_MODE.Trim()
@@ -158,51 +255,85 @@ jobs:
           }
 
           $eventName     = [string]$githubContext.event_name
-          $conclusion    = [string]$githubContext.event.workflow_run.conclusion
           $workflowRunId = [string]$githubContext.event.workflow_run.id
-          $manualRunId   = [string]$callerInputs.'build-run-id'
+          $manualRunSpecifier = [string]$callerInputs.'build-run-name'
+          if ([string]::IsNullOrWhiteSpace($manualRunSpecifier)) {
+            $manualRunSpecifier = [string]$callerInputs.'build-run-id'
+          }
           $targetEnv     = [string]$callerInputs.'target-environment'
 
           if ($promotionMode -notin @('manual-gate-tag', 'environment-approval')) {
             throw "Unsupported promotion-mode '$promotionMode'. Use 'manual-gate-tag' or 'environment-approval'."
           }
 
+          if ($eventName -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($targetEnv) -and $promotionMode -ne 'environment-approval') {
+            throw "workflow_dispatch requires caller inputs to include 'target-environment' unless promotion-mode is 'environment-approval'."
+          }
+
+          $buildRun = $null
           switch ($eventName) {
             'workflow_run' {
-              $buildRunId = $workflowRunId
+              if ([string]::IsNullOrWhiteSpace($workflowRunId)) {
+                throw "Resolved BUILD run ID is empty for event '$eventName'."
+              }
+
+              $buildRun = Get-BuildRunById -RunId $workflowRunId
             }
             'workflow_dispatch' {
-              $buildRunId = $manualRunId
+              if ([string]::IsNullOrWhiteSpace($manualRunSpecifier)) {
+                throw "workflow_dispatch requires caller inputs to include 'build-run-name' (or legacy 'build-run-id')."
+              }
+
+              $requestedBuildRun = $manualRunSpecifier.Trim()
+              if ($requestedBuildRun -match '^\d+$') {
+                $buildRun = Get-BuildRunById -RunId $requestedBuildRun
+              }
+              else {
+                $buildRun = Find-BuildRunByName -RunName $requestedBuildRun
+              }
             }
             default {
               throw "Unsupported trigger-event-name '$eventName'."
             }
           }
 
-          if ($eventName -eq 'workflow_dispatch' -and [string]::IsNullOrWhiteSpace($targetEnv)) {
-            throw "workflow_dispatch requires caller inputs to include 'target-environment'."
+          $buildRunId = [string]$buildRun.id
+          $buildRunName = Resolve-BuildRunDisplayName -Run $buildRun
+          $buildRunTagKey = ConvertTo-GateTagSegment -Value $buildRunName
+          $buildRunWorkflowPath = [string]$buildRun.path
+          $buildRunConclusion = [string]$buildRun.conclusion
+
+          if ($buildRunWorkflowPath -notmatch '(?i)\.github/workflows/build\.ya?ml@') {
+            throw "Resolved workflow run '$buildRunId' does not belong to BUILD.yml."
           }
 
-          if ([string]::IsNullOrWhiteSpace($buildRunId)) {
-            throw "Resolved BUILD run ID is empty for event '$eventName'."
+          if ($buildRunConclusion -ne 'success') {
+            throw "BUILD workflow run '$buildRunName' ($buildRunId) has conclusion '$buildRunConclusion'. Only successful BUILD runs can be deployed."
           }
 
           $requiredGateTag = ''
           if ($promotionMode -eq 'manual-gate-tag' -and -not [string]::IsNullOrWhiteSpace($previousName)) {
-            $requiredGateTag = "deployed/$previousName/$buildRunId"
+            $requiredGateTag = "$buildRunTagKey/deployed/$previousName"
           }
 
-          $successGateTag = "deployed/$environmentName/$buildRunId"
+          $successGateTag = "$buildRunTagKey/deployed/$environmentName"
+          $environmentPointerTag = "deployed/$environmentName"
 
           "build_run_id=$buildRunId"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "build_run_name=$buildRunName"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "build_run_tag_key=$buildRunTagKey"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "required_gate_tag=$requiredGateTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "success_gate_tag=$successGateTag"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "environment_pointer_tag=$environmentPointerTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "event_name=$eventName"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "target_environment=$targetEnv"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
           Write-Host "Resolved build run id: $buildRunId"
+          Write-Host "Resolved build run name: $buildRunName"
+          Write-Host "Resolved build run tag key: $buildRunTagKey"
           Write-Host "Resolved required gate tag: $requiredGateTag"
           Write-Host "Resolved success gate tag: $successGateTag"
+          Write-Host "Resolved environment pointer tag: $environmentPointerTag"
 
       - name: Check deployment gate tag
         if: steps.resolve.outputs.required_gate_tag != ''
@@ -472,22 +603,64 @@ jobs:
           & "./alm/pipelines/scripts/connect.ps1" -Url $env:DATAVERSE_URL
           & "./alm/pipelines/scripts/deploy.ps1" -ArtifactsPath "."
 
-      - name: Push success gate tag
+      - name: Push deployment tags
         if: steps.resolve.outputs.success_gate_tag != ''
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          # Record a permanent, auditable marker that this environment was successfully
-          # deployed for this build.  The next environment's workflow checks for this
-          # tag via required-gate-tag before it is allowed to proceed.
-          $successTag = '${{ steps.resolve.outputs.success_gate_tag }}'
-          $buildRunId = '${{ steps.resolve.outputs.build_run_id }}'
-          $apiBase    = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)"
-          $headers    = @{
+          # Record both:
+          # 1) a permanent, auditable gate tag for this build/environment pair, and
+          # 2) a movable environment pointer tag showing the build currently deployed
+          #    to this environment.
+          $successTag             = '${{ steps.resolve.outputs.success_gate_tag }}'
+          $environmentPointerTag  = '${{ steps.resolve.outputs.environment_pointer_tag }}'
+          $buildRunId             = '${{ steps.resolve.outputs.build_run_id }}'
+          $apiBase                = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)"
+          $headers                = @{
             Authorization = "Bearer $($env:GITHUB_TOKEN)"
             Accept        = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          function New-TagRef {
+            param(
+              [Parameter(Mandatory)][string]$TagName,
+              [Parameter(Mandatory)][string]$Sha
+            )
+
+            $body = @{ ref = "refs/tags/$TagName"; sha = $Sha } | ConvertTo-Json
+            Invoke-RestMethod -Method POST -Uri "$apiBase/git/refs" -Headers $headers -Body $body | Out-Null
+          }
+
+          function Get-TagRef {
+            param(
+              [Parameter(Mandatory)][string]$TagName,
+              [switch]$AllowMissing
+            )
+
+            $encodedTag = [Uri]::EscapeDataString($TagName)
+            try {
+              return Invoke-RestMethod -Uri "$apiBase/git/ref/tags/$encodedTag" -Headers $headers
+            } catch {
+              $status = $_.Exception.Response.StatusCode.value__
+              if ($AllowMissing -and $status -eq 404) {
+                return $null
+              }
+
+              throw
+            }
+          }
+
+          function Update-TagRef {
+            param(
+              [Parameter(Mandatory)][string]$TagName,
+              [Parameter(Mandatory)][string]$Sha
+            )
+
+            $encodedTag = [Uri]::EscapeDataString($TagName)
+            $body = @{ sha = $Sha; force = $true } | ConvertTo-Json
+            Invoke-RestMethod -Method PATCH -Uri "$apiBase/git/refs/tags/$encodedTag" -Headers $headers -Body $body | Out-Null
           }
 
           # Resolve the HEAD commit SHA of the originating BUILD run.
@@ -496,11 +669,9 @@ jobs:
           $sha = $run.head_sha
           Write-Host "HEAD SHA: $sha"
 
-          # Create the lightweight tag ref.
-          $body = @{ ref = "refs/tags/$successTag"; sha = $sha } | ConvertTo-Json
-          Write-Host "Pushing gate tag: $successTag"
+          Write-Host "Pushing permanent gate tag: $successTag"
           try {
-            Invoke-RestMethod -Method POST -Uri "$apiBase/git/refs" -Headers $headers -Body $body | Out-Null
+            New-TagRef -TagName $successTag -Sha $sha
             Write-Host "✅ Gate tag '$successTag' pushed successfully."
           } catch {
             $status = $_.Exception.Response.StatusCode.value__
@@ -508,6 +679,28 @@ jobs:
               Write-Host "ℹ️  Gate tag '$successTag' already exists (re-run?) — skipping."
             } else {
               Write-Error "Failed to push gate tag '$successTag': $_"
+              exit 1
+            }
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($environmentPointerTag)) {
+            Write-Host "Updating environment pointer tag: $environmentPointerTag"
+
+            try {
+              $existingPointerTag = Get-TagRef -TagName $environmentPointerTag -AllowMissing
+              if ($null -eq $existingPointerTag) {
+                New-TagRef -TagName $environmentPointerTag -Sha $sha
+                Write-Host "✅ Environment pointer tag '$environmentPointerTag' created successfully."
+              }
+              elseif ([string]$existingPointerTag.object.sha -eq $sha) {
+                Write-Host "ℹ️  Environment pointer tag '$environmentPointerTag' already points to $sha — no update needed."
+              }
+              else {
+                Update-TagRef -TagName $environmentPointerTag -Sha $sha
+                Write-Host "✅ Environment pointer tag '$environmentPointerTag' updated successfully."
+              }
+            } catch {
+              Write-Error "Failed to update environment pointer tag '$environmentPointerTag': $_"
               exit 1
             }
           }

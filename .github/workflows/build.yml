@@ -6,7 +6,8 @@ name: Build
 #   uses: ALM4Dataverse/ALM4Dataverse/.github/workflows/build.yml@stable
 #
 # Outputs the GitHub Actions run ID so downstream DEPLOY workflows can
-# download the artifacts produced here.
+# download the artifacts produced here. The BUILD caller workflow sets a
+# friendly run-name in the Actions UI for manual deployment selection.
 
 on:
   workflow_call:
@@ -18,8 +19,11 @@ on:
         description: 'Job timeout in minutes (matches Azure DevOps default)'
     outputs:
       run-id:
-        description: 'The GitHub Actions run ID for this build (pass to DEPLOY as build-run-id)'
+        description: 'Internal numeric GitHub Actions run ID for this build (used for artifact download)'
         value: ${{ jobs.build.outputs.run-id }}
+      run-name:
+        description: 'Friendly BUILD run name shown in the Actions UI'
+        value: ${{ jobs.build.outputs.run-name }}
 
 jobs:
   build:
@@ -30,6 +34,7 @@ jobs:
       actions: write   # upload artifacts
     outputs:
       run-id: ${{ github.run_id }}
+      run-name: ${{ steps.build-number.outputs.run_name }}
 
     steps:
       - name: Checkout source code
@@ -124,8 +129,11 @@ jobs:
           $repoName  = '${{ github.event.repository.name }}'
           $branch    = '${{ github.ref_name }}' -replace '[^a-zA-Z0-9._/-]', '-'
           $runNumber = '${{ github.run_number }}'
+          $friendlyRunName = "$branch-$runNumber"
           $buildNumber = "$repoName-$branch-$date-$runNumber"
           echo "BUILD_NUMBER=$buildNumber" >> $env:GITHUB_ENV
+          "run_name=$friendlyRunName" >> $env:GITHUB_OUTPUT
+          Write-Host "Run name: $friendlyRunName"
           Write-Host "Build number: $buildNumber"
 
       - name: Install Dependencies and Build

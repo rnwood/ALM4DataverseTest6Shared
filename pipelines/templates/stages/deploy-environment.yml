@@ -27,7 +27,12 @@ stages:
         strategy:
           runOnce:
             deploy:
-              steps:               
+              steps:
+                - checkout: self
+                  persistCredentials: true
+                  fetchDepth: 1
+                  displayName: 'Checkout Source Repository'
+
                 - task: PowerPlatformToolInstaller@2
                   displayName: 'Install Power Platform Tools'
                   inputs:
@@ -113,3 +118,55 @@ stages:
                       AZURE_CLIENT_ID: $(PowerPlatformSetConnectionVariables.BuildTools.ApplicationId)
                       AZURE_TENANT_ID: $(PowerPlatformSetConnectionVariables.BuildTools.TenantId)
                       AZURE_CLIENT_SECRET: $(PowerPlatformSetConnectionVariables.BuildTools.ClientSecret)
+
+                - pwsh: |
+                    $ErrorActionPreference = 'Stop'
+
+                    function ConvertTo-TagSegment {
+                      param([Parameter(Mandatory)][string]$Value)
+
+                      $sanitized = $Value `
+                        -replace '[^a-zA-Z0-9._/-]', '-' `
+                        -replace '\.{2,}', '-' `
+                        -replace '/{2,}', '/'
+                      $sanitized = $sanitized.Trim('/', '.')
+                      if ($sanitized.EndsWith('.lock')) {
+                        $sanitized = $sanitized -replace '\.lock$', '-lock'
+                      }
+                      if ([string]::IsNullOrWhiteSpace($sanitized)) {
+                        throw "Value '$Value' cannot be converted to a valid git tag segment"
+                      }
+
+                      return $sanitized
+                    }
+
+                    $rawBuildRunName = '$(resources.pipeline.build.runName)'
+                    $sanitizedBuildRunName = ConvertTo-TagSegment -Value $rawBuildRunName
+                    $versionTag = "v$sanitizedBuildRunName"
+                    $environmentTag = 'deployed/${{ parameters.environmentName }}'
+
+                    Write-Host "Fetching build version tag '$versionTag' from origin"
+                    git fetch --force origin "refs/tags/$versionTag:refs/tags/$versionTag"
+                    if ($LASTEXITCODE -ne 0) {
+                      throw "Failed to fetch build version tag '$versionTag' from origin"
+                    }
+
+                    $targetCommit = (git rev-list -n 1 "$versionTag").Trim()
+                    if ([string]::IsNullOrWhiteSpace($targetCommit)) {
+                      throw "Could not resolve a commit SHA from build version tag '$versionTag'"
+                    }
+
+                    Write-Host "Updating environment pointer tag '$environmentTag' to commit $targetCommit"
+                    git tag -f "$environmentTag" "$targetCommit"
+                    if ($LASTEXITCODE -ne 0) {
+                      throw "Failed to create or move environment tag '$environmentTag'"
+                    }
+
+                    git push origin "refs/tags/$environmentTag" --force
+                    if ($LASTEXITCODE -ne 0) {
+                      throw "Failed to push environment tag '$environmentTag'"
+                    }
+
+                    Write-Host "Environment pointer tag '$environmentTag' now points to build '$versionTag' ($targetCommit)."
+                  displayName: 'Update Environment Deployment Tag'
+                  workingDirectory: '$(Build.SourcesDirectory)'

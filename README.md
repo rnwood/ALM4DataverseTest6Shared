@@ -28,7 +28,7 @@ Features:
 
     The setup script automatically detects whether GitHub environment approvals are
     available for your repository and chooses the matching deployment strategy
-    (`environment-approval` or `manual-gate-tag` with prefixed repo-level credentials).
+    (`environment-approval` or `manual-gate-tag` with prefixed repo-level credentials and manual promotion from stage 1).
 
    Or follow the [GitHub Actions Setup Guide](docs/setup/github-setup.md) to configure manually.
 
