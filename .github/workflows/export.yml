@@ -71,6 +71,9 @@ jobs:
     environment:
       name: ${{ inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name) }}
       deployment: false   # export reads from Dataverse; no deployment record needed
+    concurrency:
+      group: ${{ format('alm4dataverse-environment-{0}', inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name)) }}
+      cancel-in-progress: false
     permissions:
       contents: write  # push changes back to the repository
       id-token: write  # request OIDC token for Workload Identity Federation

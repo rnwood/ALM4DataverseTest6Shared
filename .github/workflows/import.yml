@@ -61,6 +61,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
     environment: ${{ inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name) }}
+    concurrency:
+      group: ${{ format('alm4dataverse-environment-{0}', inputs.environment-name != '' && inputs.environment-name || format('Dev-{0}', github.ref_name)) }}
+      cancel-in-progress: false
     permissions:
       id-token: write  # request OIDC token for Workload Identity Federation
     env:

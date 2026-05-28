@@ -173,7 +173,7 @@ repository capability detection:
 
 Behavior remains simple:
 
-- **`manual-gate-tag`**: every stage is triggered manually from **Actions** > **DEPLOY-main** > **Run workflow**, and `target-environment` remains mandatory.
+- **`manual-gate-tag`**: every stage is triggered manually from **Actions** > **DEPLOY-main** > **Run workflow**; `target-environment` remains mandatory, while `build-run-name` can be supplied explicitly or left blank to use the latest successful BUILD from the selected branch.
 - **`environment-approval`**: when BUILD succeeds on `main`, stage 1 starts automatically and later stages auto-chain only after the previous stage succeeds and any environment approval rules pass. For a manual replay, `target-environment` can be left blank to start from the first configured stage, or set to a specific environment name to jump directly to that stage.
 
 See [Deployment Gates for GitHub Free](#deployment-gates-for-github-free).
@@ -453,7 +453,7 @@ BUILD (auto) → [human decision] → DEPLOY-main manual-run (TEST stage) → [h
 ```
 
 1. **BUILD** runs automatically on every push to `main`.
-2. A team member manually triggers **DEPLOY-main** by going to **Actions** > **DEPLOY-main** > **Run workflow**, entering the exact BUILD name shown in the run title (for example `repo-main-2025-05-27T14:23:11Z-4`), and setting `target-environment` to the desired stage (for example `TEST-main`).
+2. A team member manually triggers **DEPLOY-main** by going to **Actions** > **DEPLOY-main** > **Run workflow**, setting `target-environment` to the desired stage (for example `TEST-main`), and either entering the exact BUILD name shown in the run title (for example `repo-main-2025-05-27T14:23:11Z-4`) or leaving `build-run-name` blank to use the latest successful BUILD from the selected branch.
 3. When the selected stage succeeds it pushes two lightweight git tags:
    ```
   {build-run-name}/deployed/TEST-main
@@ -591,13 +591,13 @@ Once configured:
 - **BUILD** — runs automatically on every push. View run status in the **Actions** tab.
 - **EXPORT** — go to **Actions** > **EXPORT** > **Run workflow**, enter a commit message, and click **Run workflow**.
 - **IMPORT** — go to **Actions** > **IMPORT** > **Run workflow** and click **Run workflow**.
-- **DEPLOY-main** — enter the BUILD run name and `target-environment` for `manual-gate-tag` mode. In `environment-approval` mode, stage 1 starts automatically after BUILD succeeds and later stages auto-chain after prior-stage success plus any required approvals; for a manual replay, `target-environment` can be left blank to start from the first configured stage, while entering a value targets a specific stage.
+- **DEPLOY-main** — for `manual-gate-tag` mode, enter `target-environment` and optionally `build-run-name`; if left blank, the workflow uses the latest successful BUILD from the selected branch. In `environment-approval` mode, stage 1 starts automatically after BUILD succeeds and later stages auto-chain after prior-stage success plus any required approvals; for a manual replay, `target-environment` can be left blank to start from the first configured stage, while entering a value targets a specific stage.
 
-### Finding a BUILD run name for manual deploy
+### Finding a BUILD run name for manual deploy (optional)
 
 1. Go to **Actions** and select the **BUILD** workflow
 2. Copy the exact BUILD name shown in the run title (for example `repo-main-2025-05-27T14:23:11Z-4`). The **Set build number** step shows the same exact value.
-3. Enter that BUILD name into **DEPLOY-main** when triggering a manual deployment
+3. Enter that BUILD name into **DEPLOY-main** when you want to deploy a specific build; otherwise, leave `build-run-name` blank to use the latest successful BUILD from the selected branch.
 
 When ALM4Dataverse creates git tags from that BUILD name, it automatically sanitizes characters that git refs do not like. For example, `repo-main-2025-05-27T14:23:11Z-4` becomes the source tag `vrepo-main-2025-05-27T14-23-11Z-4`.
 

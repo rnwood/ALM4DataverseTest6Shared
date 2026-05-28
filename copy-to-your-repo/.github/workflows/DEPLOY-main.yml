@@ -12,7 +12,7 @@ name: DEPLOY-main
 #
 # See docs/setup/github-setup.md
 
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('Deploy {0} <- {1}', github.event.inputs['target-environment'], github.event.inputs['build-run-name'] || github.event.inputs['build-run-id']) || format('Deploy auto <- {0}', github.event.workflow_run.display_title || github.event.workflow_run.id) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Deploy {0} <- {1}', github.event.inputs['target-environment'], github.event.inputs['build-run-name'] || format('latest from {0}', github.ref_name)) || format('Deploy auto <- run {0}', github.run_id) }}
 
 permissions:
   actions: read
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       build-run-name:
-        description: 'Exact BUILD name to deploy (for example repo-main-2025-05-27T14:23:11Z-4). Numeric run IDs also work.'
-        required: true
+        description: 'Optional exact BUILD name to deploy. Leave blank to use the latest successful BUILD from this branch. Numeric run IDs also work.'
+        required: false
         type: string
       target-environment:
         description: 'Target environment to deploy to'
